@@ -1,0 +1,28 @@
+# Registre de la passerelle MCPortal.
+# Toutes les clés sont documentées dans src/config.rs.
+gateway:
+  name: SSP Gateway
+  tool_search: {enabled: true, max_results: 5}
+  catalog: {enabled: true, include_tool_inventory: true, include_guide: true, guide_path: guide-ssp.md}
+  health: {enabled: true, path: /health, probe_interval_seconds: 60, failure_threshold: 2}
+  metrics: {log_level: INFO, json_logs: true, prometheus: {enabled: true, port: 9090}}
+  concurrency: {global_limit: 16, acquire_timeout_seconds: 5}
+  http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
+
+servers:
+  - name: mcpdiffusion                        # sert aussi de préfixe d'outils
+    url: https://mcpdiffusion.lab.sspcloud.fr/mcp
+    transport: http                           # http | sse (sse : déprécié, non supporté)
+    domain: diffusion                         # regroupement fonctionnel
+    description: Serveur pour exposer Melodi, Rmes et insee.fr
+    tags: [dataset, publications]             # liste ou chaîne unique
+    enabled: true                             # false : gardé au registre, non exposé
+    timeout: 30.0                             # délai par appel amont (s)
+    max_concurrency: 4                        # appels simultanés vers ce serveur
+    cache_ttl: 300                            # cache des listes d'outils (s)
+
+  # TODO : serveurs cités par guide-ssp.md, URL à renseigner :
+  # - {name: insee,   url: …, domain: Insee}
+  # - {name: melodi,  url: …, domain: Insee}
+  # - {name: rmes,    url: …, domain: Insee}
+  # - {name: geodata, url: …, domain: geographie}

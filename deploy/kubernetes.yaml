@@ -1,0 +1,66 @@
+# Exemple de déploiement Kubernetes de MCPortal.
+#
+# Mise à jour de la config = rolling update (pas de hot reload) : modifiez le ConfigMap puis
+# relancez le déploiement (`kubectl rollout restart deploy/mcportal`), ou automatisez-le avec
+# une annotation `checksum/config` (Helm) ou l'outil Reloader.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcportal-config
+data:
+  registry.yaml: |
+    # Contenu de registry.yaml (guide_path: guide-ssp.md, relatif à ce fichier)
+  guide-ssp.md: |
+    # Contenu de guide-ssp.md
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcportal
+spec:
+  replicas: 2                       # possible car le serveur MCP est stateless
+  selector:
+    matchLabels: {app: mcportal}
+  template:
+    metadata:
+      labels: {app: mcportal}
+    spec:
+      # Doit dépasser le plus grand `timeout` amont (30 s) + le preStop, pour laisser les
+      # appels en cours se terminer pendant l'arrêt.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: mcportal
+          image: mcportal:0.1.0
+          ports:
+            - {name: mcp, containerPort: 8000}
+            - {name: metrics, containerPort: 9090}
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+          livenessProbe:            # le process répond (ne dépend pas des amonts)
+            httpGet: {path: /health, port: mcp}
+            periodSeconds: 10
+          readinessProbe:           # premier chargement fait, et pas en cours d'arrêt
+            httpGet: {path: /ready, port: mcp}
+            periodSeconds: 5
+          lifecycle:
+            # Laisse le temps à l'ingress de retirer le pod avant le SIGTERM.
+            # (Action `sleep` native : Kubernetes >= 1.30 ; l'image distroless n'a pas de shell.)
+            preStop:
+              sleep: {seconds: 5}
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 256Mi}
+      volumes:
+        - name: config
+          configMap: {name: mcportal-config}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcportal
+  labels: {app: mcportal}
+spec:
+  selector: {app: mcportal}
+  ports:
+    - {name: mcp, port: 80, targetPort: mcp}
+    - {name: metrics, port: 9090, targetPort: metrics}   # à ne pas exposer dans l'ingress

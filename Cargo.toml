@@ -1,0 +1,35 @@
+[package]
+name = "mcportal"
+version = "0.1.0"
+edition = "2024"
+description = "Passerelle MCP qui agrège plusieurs serveurs MCP derrière search_tools / call_tool"
+license = "MIT"
+
+[dependencies]
+rmcp = { version = "3.9.0", features = ["server", "client", "macros", "schemars", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "reqwest"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+schemars = "1"
+arc-swap = "1.9"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+jsonschema = { version = "0.61", default-features = false }
+bm25 = "2.3"
+tokio-util = "0.7"
+futures = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["async_tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[[bench]]
+name = "overhead"
+harness = false
