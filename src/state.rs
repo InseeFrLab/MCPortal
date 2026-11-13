@@ -113,8 +113,14 @@ impl AppState {
             })
             .collect();
         let c = &config.gateway.concurrency;
+        if c.global_limit.is_some() {
+            tracing::warn!(
+                "gateway.concurrency.global_limit is deprecated and ignored: only the per-server \
+                 max_concurrency limits apply"
+            );
+        }
         Arc::new(Self {
-            limits: Limits::new(c.global_limit, c.acquire_timeout()),
+            limits: Limits::new(c.acquire_timeout()),
             upstreams,
             catalog: ArcSwap::from_pointee(ToolCatalog::empty()),
             ready: AtomicBool::new(false),

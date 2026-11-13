@@ -182,7 +182,7 @@ async fn server_concurrency_limit_rejects_excess_calls() {
     let up = spawn_upstream(&ct).await;
     let gw = spawn_gateway(config(
         &[("mock", &up)],
-        "  concurrency: {global_limit: 10, acquire_timeout_seconds: 0.1}",
+        "  concurrency: {acquire_timeout_seconds: 0.1}",
         "    max_concurrency: 1",
     ))
     .await;
@@ -199,6 +199,43 @@ async fn server_concurrency_limit_rejects_excess_calls() {
     assert!(is_error(&second));
     assert!(text(&second).contains("saturated"), "{}", text(&second));
     ct.cancel();
+}
+
+/// An upstream that accepts TCP connections but never answers must not make the calls queue
+/// up one behind the other (each one waiting its full `timeout`).
+#[tokio::test]
+async fn hanging_upstream_does_not_queue_calls() {
+    use mcportal::{config::Config, upstream::Upstream};
+    use std::time::Instant;
+
+    // Accepts the connections and keeps them open without ever answering.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let yaml = format!(
+        "gateway: {{name: T}}\nservers:\n  - {{name: hang, url: 'http://{addr}/mcp', timeout: 1}}\n"
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    let upstream = Upstream::new(config.servers[0].clone(), 1);
+
+    // Three simultaneous calls: one connection attempt, the others reuse its failure.
+    // Before the fix, they connected one after the other: ~3 s.
+    let started = Instant::now();
+    let (a, b, c) = tokio::join!(upstream.probe(), upstream.probe(), upstream.probe());
+    let elapsed = started.elapsed();
+    assert!(a.is_err() && b.is_err() && c.is_err());
+    assert!(elapsed < Duration::from_millis(1800), "{elapsed:?}");
+
+    // During the cooldown, a new call fails immediately with an explicit message.
+    let started = Instant::now();
+    let err = upstream.probe().await.unwrap_err().to_string();
+    assert!(started.elapsed() < Duration::from_millis(200));
+    assert!(err.contains("next connection attempt"), "{err}");
 }
 
 // ---------------------------------------------------------------------------------------------

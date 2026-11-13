@@ -31,7 +31,7 @@ without consuming context.
 - Arguments validated against the target tool's JSON Schema before any upstream call.
 - Transparent relaying of results, progress, cancellation and multi-turn exchanges
   (`input_required`).
-- Global and per-server concurrency limits, with a bounded wait time.
+- Per-server concurrency limits, with a bounded wait time.
 - Upstream health probes; a failing upstream breaks neither the catalog nor the others.
 - JSON logs on standard output (Loki / Grafana) and Prometheus metrics.
 - `/health` (liveness), `/ready` (readiness) and graceful shutdown for Kubernetes.
@@ -68,7 +68,7 @@ gateway:
   catalog: {enabled: true, include_tool_inventory: true, include_guide: true, guide_path: guide-ssp.md}
   health: {enabled: true, path: /health, probe_interval_seconds: 60, failure_threshold: 2}
   metrics: {log_level: INFO, json_logs: true, prometheus: {enabled: true, port: 9090}}
-  concurrency: {global_limit: 16, acquire_timeout_seconds: 5}
+  concurrency: {acquire_timeout_seconds: 5}
   http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
 
 servers:

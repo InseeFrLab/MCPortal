@@ -12,7 +12,7 @@
 //!   catalog: {enabled: true, include_tool_inventory: true, include_guide: true, guide_path: guide-ssp.md}
 //!   health: {enabled: true, path: /health, probe_interval_seconds: 60, failure_threshold: 2}
 //!   metrics: {log_level: INFO, json_logs: true, prometheus: {enabled: true, port: 9090}}
-//!   concurrency: {global_limit: 16, acquire_timeout_seconds: 5}
+//!   concurrency: {acquire_timeout_seconds: 5}
 //!
 //! servers:
 //!   - name: mcpdiffusion
@@ -111,9 +111,6 @@ impl Config {
         let invalid = |msg: String| Err(ConfigError::Invalid(msg));
 
         let g = &self.gateway;
-        if g.concurrency.global_limit == 0 {
-            return invalid("gateway.concurrency.global_limit must be >= 1".into());
-        }
         if g.tool_search.max_results == 0 {
             return invalid("gateway.tool_search.max_results must be >= 1".into());
         }
@@ -325,13 +322,16 @@ impl Default for PrometheusConfig {
     }
 }
 
-/// Global concurrency limit (V1: no per-user limit).
+/// Concurrency settings (V1: no per-user limit). The limits themselves are per server
+/// (`max_concurrency`), see [`crate::limits`].
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConcurrencyConfig {
-    /// Maximum number of concurrent upstream calls, across all servers.
-    #[serde(default = "default_global_limit")]
-    pub global_limit: usize,
+    /// **Deprecated, ignored.** Former limit across all servers, removed because it coupled
+    /// the servers to one another (see [`crate::limits`]). Still accepted so that existing
+    /// registries keep loading; a warning is logged at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_limit: Option<usize>,
     /// Maximum wait for a permit before answering "saturated".
     #[serde(default = "default_acquire_timeout")]
     pub acquire_timeout_seconds: f64,
@@ -346,7 +346,7 @@ impl ConcurrencyConfig {
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
         Self {
-            global_limit: default_global_limit(),
+            global_limit: None,
             acquire_timeout_seconds: default_acquire_timeout(),
         }
     }
@@ -483,9 +483,6 @@ fn default_log_level() -> String {
 fn default_prometheus_port() -> u16 {
     9090
 }
-fn default_global_limit() -> usize {
-    16
-}
 fn default_acquire_timeout() -> f64 {
     5.0
 }
@@ -538,7 +535,7 @@ gateway:
   catalog: {enabled: true, include_tool_inventory: true, include_guide: true, guide_path: guide-ssp.md}
   health: {enabled: true, path: /health, probe_interval_seconds: 60, failure_threshold: 2}
   metrics: {log_level: INFO, json_logs: true, prometheus: {enabled: true, port: 9090}}
-  concurrency: {global_limit: 16, acquire_timeout_seconds: 5}
+  concurrency: {acquire_timeout_seconds: 5}
 servers:
   - name: mcpdiffusion
     url: https://mcpdiffusion.lab.sspcloud.fr/mcp
@@ -593,6 +590,14 @@ servers:
         let yaml =
             "gateway: {name: T}\nservers:\n  - {name: a, url: http://x/mcp, max_concurrency: 0}\n";
         assert!(Config::from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn deprecated_global_limit_is_still_accepted() {
+        // Removed setting: existing registries must keep loading.
+        let yaml = "gateway: {name: T, concurrency: {global_limit: 16}}\n";
+        let c = Config::from_yaml(yaml).unwrap();
+        assert_eq!(c.gateway.concurrency.global_limit, Some(16));
     }
 
     #[test]

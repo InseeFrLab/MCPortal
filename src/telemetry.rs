@@ -40,7 +40,7 @@ pub mod metric {
     pub const UPSTREAM_UP: &str = "mcportal_upstream_up";
     /// gauge — label: server — in-flight calls
     pub const INFLIGHT: &str = "mcportal_inflight";
-    /// counter — label: scope (global | server)
+    /// counter — label: scope (always "server")
     pub const RATELIMIT_REJECTIONS: &str = "mcportal_ratelimit_rejections_total";
     /// counter
     pub const SEARCH_QUERIES: &str = "mcportal_search_queries_total";

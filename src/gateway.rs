@@ -35,7 +35,7 @@
 //! 1. read the current catalog (ArcSwap::load, lock-free)
 //! 2. resolve the exposed name → (server, upstream name)   otherwise: error + close names
 //! 3. validate the arguments (compiled JSON Schema)        otherwise: detailed error
-//! 4. acquire permits (global then server)                 otherwise: "saturated"
+//! 4. acquire a permit on the server                       otherwise: "saturated"
 //! 5. call the upstream (timeout, progress, cancellation)
 //! 6. return the upstream result AS IS (content, structuredContent, isError, _meta…)
 //! ```

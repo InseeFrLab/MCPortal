@@ -6,7 +6,7 @@ gateway:
   catalog: {enabled: true, include_tool_inventory: true, include_guide: true, guide_path: guide-ssp.md}
   health: {enabled: true, path: /health, probe_interval_seconds: 60, failure_threshold: 2}
   metrics: {log_level: INFO, json_logs: true, prometheus: {enabled: true, port: 9090}}
-  concurrency: {global_limit: 16, acquire_timeout_seconds: 5}
+  concurrency: {acquire_timeout_seconds: 5}
   http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
 
 servers:

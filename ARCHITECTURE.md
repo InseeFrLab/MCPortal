@@ -76,7 +76,8 @@ One `Upstream` per registry server. It holds:
 
 - **one rmcp connection shared** by all users. With Streamable HTTP, every call is an
   independent POST: a single client is enough for concurrent calls. The connection is
-  opened when first needed and reopened if the transport closes;
+  opened when first needed and reopened if the transport closes. It is read lock-free
+  (`ArcSwapOption`); a mutex only serializes connection attempts;
 - **a semaphore** with `max_concurrency` permits;
 - **the health state** (consecutive failures, last error, timestamps) and counters;
 - **the tool list cache**, timestamped to honor `cache_ttl`.
@@ -86,7 +87,15 @@ then a fallback to `initialize` for older upstreams.
 
 Every upstream error is translated into an `UpstreamError` (`Unavailable`, `Timeout`,
 `Protocol`). A transport error invalidates the connection, which is reopened on the next
-call.
+call. Only the connection that failed is invalidated: a late error on an old connection
+does not close the one that replaced it.
+
+The `timeout` of an operation covers **everything**, including waiting for a connection:
+no call lasts longer than `timeout`. After a failed connection attempt, the failure is kept
+for 5 seconds (`RECONNECT_COOLDOWN`): the calls waiting for this attempt, and those that
+arrive during that window, fail immediately instead of each retrying in turn. Without it,
+N calls to an upstream that accepts TCP connections but never answers would wait
+N × `timeout`.
 
 ### `state`: the shared state
 
@@ -140,8 +149,9 @@ can also extract the servers and tools cited by a guide, which the drift tests u
 
 ### `limits`: concurrency
 
-Two semaphores acquired in **global then server** order, with a single timeout for both.
-Permits are released automatically when the `CallPermit` is dropped, including on error or
+One semaphore **per server** (`max_concurrency`), acquired within `acquire_timeout_seconds`.
+There is no global limit: it would couple the servers to one another (see
+[Design decisions](#concurrency-and-limits-per-server-in-v1)). Permits are released automatically when the `CallPermit` is dropped, including on error or
 cancellation. Past the timeout, the call is rejected with a readable message.
 
 ### `server` and `main`: HTTP and lifecycle
@@ -170,7 +180,7 @@ client ──tools/call {name: "call_tool", arguments: {name, arguments}}──�
   2. catalog.load()                         lock-free read of the current version
   3. resolve the exposed name               unknown → isError + close names (BM25)
   4. JSON Schema validation                 invalid → isError + list of errors
-  5. limits.acquire (global then server)    timeout exceeded → isError "saturated"
+  5. limits.acquire (server permit)         timeout exceeded → isError "saturated"
   6. upstream.call_tool                     timeout, cancellation, progress relay
   7. upstream result returned as is         upstream error → readable isError
   8. metrics + "tool call" log
@@ -196,8 +206,10 @@ whereas an `isError` is read by the LLM.
 - **Progress**: the rmcp client imposes its own `progressToken` on every request (a counter
   per connection). So we send the request, read the chosen token
   (`RequestHandle::progress_token`), then register the "upstream token → downstream client"
-  route in the `ProgressRouter` **of that connection**. A notification that arrives before
-  the registration is kept and relayed afterwards. The downstream client receives its own
+  route in the `ProgressRouter` **of that connection**. A notification without a route is
+  dropped: either the client asked for no progress (rmcp still sends a token upstream), or,
+  in theory, it arrived in the few microseconds between the send and the registration,
+  which is negligible next to an HTTP round trip. The downstream client receives its own
   token.
 - **Multi-round-trip requests (MRTR)**: an upstream `InputRequiredResult` is returned as is
   to the downstream client. When the client calls `call_tool` again with `inputResponses` /
@@ -228,8 +240,9 @@ Multi-threaded `tokio` runtime; each HTTP request is a task. Rules followed:
 
 - no blocking call on the request path (the guide is read with `tokio::fs`);
 - `std::sync::Mutex` only for very short critical sections, without `await`;
-- `tokio::sync::Mutex` for the upstream connection, held while connecting so that two
-  simultaneous requests open only one connection;
+- `ArcSwapOption` for the upstream connection (lock-free read on every call), and a
+  `tokio::sync::Mutex` held only while connecting, so that two simultaneous requests open
+  only one connection;
 - `ArcSwap` for data read everywhere and written rarely (the catalog).
 
 ## Startup and shutdown
@@ -255,7 +268,7 @@ traffic with an empty catalog during a rolling update.
 | `mcportal_gateway_overhead_seconds` | histogram | — |
 | `mcportal_upstream_up` | gauge | server |
 | `mcportal_inflight` | gauge | server |
-| `mcportal_ratelimit_rejections_total` | counter | scope (global, server) |
+| `mcportal_ratelimit_rejections_total` | counter | scope (always `server`) |
 | `mcportal_search_queries_total` | counter | — |
 | `mcportal_catalog_tools` | gauge | — |
 | `mcportal_feedback_total` | counter | server |
@@ -315,10 +328,20 @@ reliable detection of ConfigMap updates (atomic replacement of a symbolic link).
 need comes back, the catalog's `ArcSwap` already provides the swap mechanism: what would
 remain is watching the file and diffing the upstreams.
 
-### Concurrency and limits: global in V1
+### Concurrency and limits: per server in V1
 
-Two limits, global and per server, protect the upstreams without needing to know who is
-calling. There is no authentication and no per-user limit in V1.
+One limit per server (`max_concurrency`) protects each upstream without needing to know who
+is calling. There is no authentication and no per-user limit in V1.
+
+A global limit across all servers existed at first and was removed. It did not protect the
+gateway (an in-flight call costs a tokio task and an HTTP request, and the total is already
+bounded by the sum of the servers' limits), but it **coupled the servers**: calls waiting
+for a permit on a slow or failing server held global permits, and calls to healthy servers
+were rejected as "saturated". Below the sum of the servers' limits it causes this coupling;
+above it, it never applies. The `global_limit` key is still accepted in the registry
+(ignored, with a warning) so that existing configs keep loading. If the gateway itself ever
+needs protecting, it belongs on incoming requests (a concurrency layer on `/mcp`, or
+autoscaling), not on upstream calls.
 
 Points to keep in mind for later:
 
@@ -389,4 +412,5 @@ stream (`json_response`) reduced it by about 20%.
 | tantivy / DuckDB for search | oversized for a few hundred tools |
 | Authentication, per-user limits | postponed until after V1 (see above) |
 | Per-IP-address limit | ineffective with Claude.ai connectors |
+| Global concurrency limit | couples the servers to one another without protecting the gateway |
 | Upstream `sse` transport | deprecated by the spec and absent from the rmcp 3.x client |

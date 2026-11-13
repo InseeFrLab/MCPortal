@@ -20,18 +20,7 @@
 //! upstream is older. rmcp also handles renewing an expired session
 //! (`reinit_on_expired_session`) for these older upstreams.
 //!
-//! ## Relaying progress notifications
 //!
-//! When the downstream client provides a `progressToken`, the upstream's
-//! `notifications/progress` must be relayed to it. Two subtleties:
-//!
-//! - the rmcp client **imposes its own token** on every upstream request (a per-connection
-//!   counter): it is only known after sending (`RequestHandle::progress_token`);
-//! - this counter restarts from zero on each connection: the mapping table
-//!   ([`ProgressRouter`]) is therefore **specific to each** upstream connection.
-//!
-//! The [`ProgressRouter`] maps "upstream token → (downstream client, downstream token)" and
-//! gives the downstream client back its original token.
 
 use std::{
     collections::HashMap,
@@ -42,6 +31,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use arc_swap::ArcSwapOption;
 use rmcp::{
     ClientHandler, ClientLifecycleMode, ClientServiceExt, Peer, RoleClient, RoleServer,
     model::{
@@ -66,6 +56,11 @@ struct Connection {
     progress: Arc<ProgressRouter>,
 }
 
+/// Pause after a failed connection attempt. During this window, calls fail immediately
+/// instead of each retrying in turn: without it, N calls queued behind an upstream that does
+/// not answer would wait N × `timeout`.
+const RECONNECT_COOLDOWN: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------------------------
@@ -89,73 +84,43 @@ pub enum UpstreamError {
 // ---------------------------------------------------------------------------------------------
 
 /// "upstream token → (downstream client, downstream token)" table of **one** upstream connection.
+///
+/// A notification without a route is dropped. This covers calls whose client asked for no
+/// progress (rmcp still sends a token upstream) and, in theory, a notification arriving
+/// between the send and `register`: that window is a few microseconds, versus an HTTP round
+/// trip, and losing one informational notification breaks nothing.
 #[derive(Default)]
 pub struct ProgressRouter {
-    inner: Mutex<RouterInner>,
+    routes: Mutex<HashMap<ProgressToken, (Peer<RoleServer>, ProgressToken)>>,
 }
-
-#[derive(Default)]
-struct RouterInner {
-    routes: HashMap<ProgressToken, (Peer<RoleServer>, ProgressToken)>,
-    /// Notifications received **before** their route was registered: the request is sent
-    /// upstream before its token is known, so a very fast notification can arrive first. It
-    /// is kept aside (bounded size) instead of being lost.
-    early: HashMap<ProgressToken, Vec<ProgressNotificationParam>>,
-}
-
-/// Beyond this, "orphan" notifications are dropped (tokens of requests without a relay).
-const MAX_EARLY_TOKENS: usize = 256;
 
 impl ProgressRouter {
     /// Registers the route of a call. It is removed when the returned [`ProgressRoute`] is
-    /// dropped (end of the call). Notifications that arrived early are relayed.
+    /// dropped (end of the call).
     pub fn register(
         self: &Arc<Self>,
         upstream_token: ProgressToken,
         downstream: Peer<RoleServer>,
         downstream_token: ProgressToken,
     ) -> ProgressRoute {
-        let early = {
-            let mut inner = self.inner.lock().expect("progress lock");
-            inner.routes.insert(
-                upstream_token.clone(),
-                (downstream.clone(), downstream_token.clone()),
-            );
-            inner.early.remove(&upstream_token).unwrap_or_default()
-        };
-        if !early.is_empty() {
-            tokio::spawn(async move {
-                for mut params in early {
-                    params.progress_token = downstream_token.clone();
-                    let _ = downstream.notify_progress(params).await;
-                }
-            });
-        }
+        self.routes
+            .lock()
+            .expect("progress lock")
+            .insert(upstream_token.clone(), (downstream, downstream_token));
         ProgressRoute {
             router: self.clone(),
             token: upstream_token,
         }
     }
 
-    /// Forwards the notification to the relevant downstream client.
+    /// Forwards the notification to the relevant downstream client, if any.
     async fn forward(&self, mut params: ProgressNotificationParam) {
-        let route = {
-            let mut inner = self.inner.lock().expect("progress lock");
-            match inner.routes.get(&params.progress_token) {
-                Some(route) => Some(route.clone()),
-                None => {
-                    if inner.early.len() >= MAX_EARLY_TOKENS {
-                        inner.early.clear();
-                    }
-                    inner
-                        .early
-                        .entry(params.progress_token.clone())
-                        .or_default()
-                        .push(params.clone());
-                    None
-                }
-            }
-        };
+        let route = self
+            .routes
+            .lock()
+            .expect("progress lock")
+            .get(&params.progress_token)
+            .cloned();
         if let Some((peer, downstream_token)) = route {
             params.progress_token = downstream_token;
             if let Err(e) = peer.notify_progress(params).await {
@@ -173,9 +138,8 @@ pub struct ProgressRoute {
 
 impl Drop for ProgressRoute {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.router.inner.lock() {
-            inner.routes.remove(&self.token);
-            inner.early.remove(&self.token);
+        if let Ok(mut routes) = self.router.routes.lock() {
+            routes.remove(&self.token);
         }
     }
 }
@@ -284,9 +248,13 @@ pub struct Upstream {
     failure_threshold: u32,
     /// `max_concurrency` limit of this server.
     pub semaphore: Semaphore,
-    /// Current connection. `tokio::sync::Mutex` because it is held across the connection
-    /// `await`: two simultaneous requests thus trigger only one connection.
-    connection: tokio::sync::Mutex<Option<Arc<Connection>>>,
+    /// Current connection. `ArcSwapOption`: read lock-free by every call, replaced on
+    /// (re)connection and cleared when the transport fails.
+    connection: ArcSwapOption<Connection>,
+    /// Serializes connection attempts (two simultaneous calls open only one connection) and
+    /// holds the time and reason of the last failed attempt (see [`RECONNECT_COOLDOWN`]).
+    /// `tokio::sync::Mutex` because it is held across the connection `await`.
+    connect_lock: tokio::sync::Mutex<Option<(Instant, String)>>,
     /// `std::sync::Mutex`: very short critical sections, never an `await` inside.
     health: Mutex<Health>,
     tools: Mutex<Option<ToolCache>>,
@@ -300,7 +268,8 @@ impl Upstream {
             semaphore: Semaphore::new(config.max_concurrency),
             config,
             failure_threshold,
-            connection: tokio::sync::Mutex::new(None),
+            connection: ArcSwapOption::empty(),
+            connect_lock: tokio::sync::Mutex::new(None),
             health: Mutex::new(Health {
                 consecutive_failures: 0,
                 last_error: None,
@@ -320,33 +289,91 @@ impl Upstream {
 
     // --- Connection -----------------------------------------------------------------------
 
-    /// Returns the current connection, (re)connecting if needed.
-    async fn connection(&self) -> Result<Arc<Connection>, UpstreamError> {
-        let mut guard = self.connection.lock().await;
-        if let Some(connection) = guard.as_ref()
-            && !connection.client.is_closed()
-        {
-            return Ok(connection.clone());
+    /// Deadline of an operation started now: it covers **everything**, the wait for a
+    /// connection included, so that no call lasts longer than `timeout`.
+    fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.config.timeout()
+    }
+
+    fn timeout_error(&self) -> UpstreamError {
+        UpstreamError::Timeout {
+            server: self.config.name.clone(),
+            timeout: self.config.timeout(),
         }
-        let connection = Arc::new(self.connect().await?);
-        *guard = Some(connection.clone());
-        Ok(connection)
     }
 
-    /// Forgets the current connection (it will be reopened on the next call).
-    async fn invalidate(&self) {
-        self.connection.lock().await.take();
+    /// The open connection, if any (lock-free).
+    fn current_connection(&self) -> Option<Arc<Connection>> {
+        self.connection
+            .load_full()
+            .filter(|connection| !connection.client.is_closed())
     }
 
-    async fn connect(&self) -> Result<Connection, UpstreamError> {
+    /// Returns the current connection, (re)connecting if needed, before `deadline`.
+    ///
+    /// - Common case: the connection is open, read lock-free.
+    /// - Otherwise one task connects while the others wait for its result on `connect_lock`.
+    ///   If the attempt fails, the failure is kept for [`RECONNECT_COOLDOWN`]: the waiting
+    ///   tasks, and the calls that arrive during that window, fail immediately instead of
+    ///   each retrying in turn.
+    ///
+    /// The connection attempt is bounded by `deadline` itself (never cut by an outer timeout),
+    /// so a failure is always recorded. Only a downstream cancellation can interrupt it, in
+    /// which case the next call simply tries again.
+    async fn connection(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<Connection>, UpstreamError> {
+        if let Some(connection) = self.current_connection() {
+            return Ok(connection);
+        }
+        let mut last_failure = tokio::time::timeout_at(deadline, self.connect_lock.lock())
+            .await
+            .map_err(|_| self.timeout_error())?;
+        // Another task may have connected while we were waiting.
+        if let Some(connection) = self.current_connection() {
+            return Ok(connection);
+        }
         let unavailable = |reason: String| UpstreamError::Unavailable {
             server: self.config.name.clone(),
             reason,
         };
+        if let Some((at, reason)) = last_failure.as_ref()
+            && at.elapsed() < RECONNECT_COOLDOWN
+        {
+            let retry_in = RECONNECT_COOLDOWN.saturating_sub(at.elapsed());
+            return Err(unavailable(format!(
+                "{reason} (next connection attempt in {}s)",
+                retry_in.as_secs().max(1)
+            )));
+        }
+        match self.connect(deadline).await {
+            Ok(connection) => {
+                let connection = Arc::new(connection);
+                self.connection.store(Some(connection.clone()));
+                *last_failure = None;
+                Ok(connection)
+            }
+            Err(reason) => {
+                self.connection.store(None);
+                *last_failure = Some((Instant::now(), reason.clone()));
+                Err(unavailable(reason))
+            }
+        }
+    }
+
+    /// Forgets the connection `used` (it will be reopened on the next call), **unless** it has
+    /// already been replaced: a late failure on an old connection must not close the new one.
+    fn invalidate(&self, used: &Arc<Connection>) {
+        self.connection.compare_and_swap(&Some(used.clone()), None);
+    }
+
+    /// Opens a connection before `deadline`. Returns the reason of the failure.
+    async fn connect(&self, deadline: tokio::time::Instant) -> Result<Connection, String> {
         if self.config.transport == Transport::Sse {
-            return Err(unavailable(
+            return Err(
                 "'sse' transport is deprecated and not supported by rmcp 3.x: use 'http'".into(),
-            ));
+            );
         }
 
         let mut transport_config =
@@ -366,16 +393,16 @@ impl Upstream {
             legacy_version: Some(ProtocolVersion::V_2025_11_25),
         };
         let connecting = handler.serve_with_lifecycle(transport, lifecycle);
-        match tokio::time::timeout(self.config.timeout(), connecting).await {
+        match tokio::time::timeout_at(deadline, connecting).await {
             Ok(Ok(client)) => {
                 tracing::info!(server = %self.config.name, "connected to upstream");
                 Ok(Connection { client, progress })
             }
-            Ok(Err(e)) => Err(unavailable(e.to_string())),
-            Err(_) => Err(unavailable(format!(
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!(
                 "no response to initialization within {:?}",
                 self.config.timeout()
-            ))),
+            )),
         }
     }
 
@@ -383,10 +410,10 @@ impl Upstream {
 
     /// Lists **all** the upstream's tools (every page), with a timeout.
     pub async fn fetch_tools(&self) -> Result<Vec<Tool>, UpstreamError> {
-        let connection = self.connection().await?;
-        let result =
-            tokio::time::timeout(self.config.timeout(), connection.client.list_all_tools()).await;
-        self.map_result(result).await
+        let deadline = self.deadline();
+        let connection = self.connection(deadline).await?;
+        let result = tokio::time::timeout_at(deadline, connection.client.list_all_tools()).await;
+        self.map_result(result, &connection)
     }
 
     /// Lightweight probe: the first page of `tools/list`.
@@ -394,10 +421,10 @@ impl Upstream {
     /// `ping` no longer exists in MCP 2026-07-28 and `server/discover` does not exist in
     /// earlier versions: `tools/list` is the only request all our upstreams serve.
     pub async fn probe(&self) -> Result<(), UpstreamError> {
-        let connection = self.connection().await?;
-        let result =
-            tokio::time::timeout(self.config.timeout(), connection.client.list_tools(None)).await;
-        self.map_result(result).await.map(|_| ())
+        let deadline = self.deadline();
+        let connection = self.connection(deadline).await?;
+        let result = tokio::time::timeout_at(deadline, connection.client.list_tools(None)).await;
+        self.map_result(result, &connection).map(|_| ())
     }
 
     /// Calls an upstream tool **without** handling MRTR rounds: if the upstream returns an
@@ -412,8 +439,9 @@ impl Upstream {
         progress: Option<(Peer<RoleServer>, ProgressToken)>,
     ) -> Result<CallToolResponse, UpstreamError> {
         self.calls_total.fetch_add(1, Ordering::Relaxed);
+        let deadline = self.deadline();
         let connection = self
-            .connection()
+            .connection(deadline)
             .await
             .inspect_err(|_| self.count_failure())?;
 
@@ -424,9 +452,8 @@ impl Upstream {
                 Some(downstream) => Self::call_with_progress(&connection, params, downstream).await,
             }
         };
-        let result = tokio::time::timeout(self.config.timeout(), call).await;
-        self.map_result(result)
-            .await
+        let result = tokio::time::timeout_at(deadline, call).await;
+        self.map_result(result, &connection)
             .inspect_err(|_| self.count_failure())
     }
 
@@ -467,18 +494,16 @@ impl Upstream {
     }
 
     /// Converts (timeout | rmcp error | success) into `Result<T, UpstreamError>`, and
-    /// invalidates the connection if the error comes from the transport.
-    async fn map_result<T>(
+    /// invalidates `connection` if the error comes from the transport.
+    fn map_result<T>(
         &self,
         result: Result<Result<T, ServiceError>, tokio::time::error::Elapsed>,
+        connection: &Arc<Connection>,
     ) -> Result<T, UpstreamError> {
         let server = self.config.name.clone();
         match result {
             Ok(Ok(value)) => Ok(value),
-            Err(_) => Err(UpstreamError::Timeout {
-                server,
-                timeout: self.config.timeout(),
-            }),
+            Err(_) => Err(self.timeout_error()),
             // JSON-RPC error returned by the upstream: the connection is healthy.
             Ok(Err(ServiceError::McpError(e))) => Err(UpstreamError::Protocol {
                 server,
@@ -486,7 +511,7 @@ impl Upstream {
             }),
             // Any other error (transport closed, unexpected response…): reconnect later.
             Ok(Err(e)) => {
-                self.invalidate().await;
+                self.invalidate(connection);
                 Err(UpstreamError::Unavailable {
                     server,
                     reason: e.to_string(),
