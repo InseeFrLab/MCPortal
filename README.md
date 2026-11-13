@@ -124,6 +124,7 @@ measurement.
 
 ## Documentation
 
+- [Website](https://inseefrlab.github.io/MCPortal/): project landing page (source in [`website/`](website/)).
 - [ARCHITECTURE.md](ARCHITECTURE.md): code layout, internals and design decisions.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to contribute.
 - [`src/guide.md`](src/guide.md): usage guide served to MCP clients.
