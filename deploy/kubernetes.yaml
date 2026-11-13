@@ -1,32 +1,32 @@
-# Exemple de déploiement Kubernetes de MCPortal.
+# Example Kubernetes deployment of MCPortal.
 #
-# Mise à jour de la config = rolling update (pas de hot reload) : modifiez le ConfigMap puis
-# relancez le déploiement (`kubectl rollout restart deploy/mcportal`), ou automatisez-le avec
-# une annotation `checksum/config` (Helm) ou l'outil Reloader.
+# Config update = rolling update (no hot reload): change the ConfigMap then restart the
+# deployment (`kubectl rollout restart deploy/mcportal`), or automate it with a
+# `checksum/config` annotation (Helm) or the Reloader tool.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mcportal-config
 data:
   registry.yaml: |
-    # Contenu de registry.yaml (guide_path: guide-ssp.md, relatif à ce fichier)
+    # Content of registry.yaml (guide_path: guide-ssp.md, relative to this file)
   guide-ssp.md: |
-    # Contenu de guide-ssp.md
+    # Content of guide-ssp.md
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mcportal
 spec:
-  replicas: 2                       # possible car le serveur MCP est stateless
+  replicas: 2                       # possible because the MCP server is stateless
   selector:
     matchLabels: {app: mcportal}
   template:
     metadata:
       labels: {app: mcportal}
     spec:
-      # Doit dépasser le plus grand `timeout` amont (30 s) + le preStop, pour laisser les
-      # appels en cours se terminer pendant l'arrêt.
+      # Must exceed the largest upstream `timeout` (30 s) + the preStop, to let in-flight
+      # calls finish during shutdown.
       terminationGracePeriodSeconds: 45
       containers:
         - name: mcportal
@@ -36,15 +36,15 @@ spec:
             - {name: metrics, containerPort: 9090}
           volumeMounts:
             - {name: config, mountPath: /config, readOnly: true}
-          livenessProbe:            # le process répond (ne dépend pas des amonts)
+          livenessProbe:            # the process responds (does not depend on upstreams)
             httpGet: {path: /health, port: mcp}
             periodSeconds: 10
-          readinessProbe:           # premier chargement fait, et pas en cours d'arrêt
+          readinessProbe:           # first load done, and not shutting down
             httpGet: {path: /ready, port: mcp}
             periodSeconds: 5
           lifecycle:
-            # Laisse le temps à l'ingress de retirer le pod avant le SIGTERM.
-            # (Action `sleep` native : Kubernetes >= 1.30 ; l'image distroless n'a pas de shell.)
+            # Gives the ingress time to remove the pod before SIGTERM.
+            # (Native `sleep` action: Kubernetes >= 1.30; the distroless image has no shell.)
             preStop:
               sleep: {seconds: 5}
           resources:
@@ -63,4 +63,4 @@ spec:
   selector: {app: mcportal}
   ports:
     - {name: mcp, port: 80, targetPort: mcp}
-    - {name: metrics, port: 9090, targetPort: metrics}   # à ne pas exposer dans l'ingress
+    - {name: metrics, port: 9090, targetPort: metrics}   # do not expose through the ingress

@@ -2,7 +2,7 @@
 name = "mcportal"
 version = "0.1.0"
 edition = "2024"
-description = "Passerelle MCP qui agrège plusieurs serveurs MCP derrière search_tools / call_tool"
+description = "MCP gateway that aggregates several MCP servers behind search_tools / call_tool"
 license = "MIT"
 
 [dependencies]

@@ -2,45 +2,44 @@
   <img src="docs/assets/MCPortal_logo.png" alt="MCPortal logo" width="200">
 </p>
 
-Ce Portail MCP agrège plusieurs serveurs MCP déclarés dans un
-registre YAML et les expose à un client MCP (Claude, Claude Code…) sous la forme d'**un
-seul serveur**. 
+MCPortal aggregates several MCP servers declared in a YAML registry and exposes them to an
+MCP client (Claude, Claude Code…) as **a single server**.
 
 ```text
-client MCP ──HTTP──▶ MCPortal ──HTTP──▶ serveur MCP « insee »
-                                 ├────▶ serveur MCP « melodi »
-                                 └────▶ serveur MCP « geodata »
+MCP client ──HTTP──▶ MCPortal ──HTTP──▶ "insee" MCP server
+                                 ├────▶ "melodi" MCP server
+                                 └────▶ "geodata" MCP server
 ```
 
-Plutôt que de charger des dizaines d'outils dans le contexte du client, la passerelle
-expose trois outils :
+Rather than loading dozens of tools into the client's context, the gateway exposes three
+tools:
 
-| Outil | Rôle |
+| Tool | Purpose |
 | --- | --- |
-| `search_tools(query, limit?)` | recherche plein texte (BM25) parmi les outils de tous les serveurs ; renvoie leur nom et leur `inputSchema` |
-| `call_tool(name, arguments)` | appelle un outil amont par son nom complet `{serveur}_{outil}` |
-| `send_feedback(server, author, feedback)` | consigne un retour dans les logs (label `FEEDBACK`) |
+| `search_tools(query, limit?)` | full-text search (BM25) across the tools of every server; returns their name and `inputSchema` |
+| `call_tool(name, arguments)` | calls an upstream tool by its full name `{server}_{tool}` |
+| `send_feedback(server, author, feedback)` | records feedback in the logs (label `FEEDBACK`) |
 
-Elle expose aussi un **catalogue en ressources** (`catalog://servers`, `catalog://domains`,
-`catalog://servers/{nom}`, `catalog://servers/{nom}/tools`, `catalog://guide`), lisible
-sans consommer de contexte.
+It also exposes a **catalog as resources** (`catalog://servers`, `catalog://domains`,
+`catalog://servers/{name}`, `catalog://servers/{name}/tools`, `catalog://guide`), readable
+without consuming context.
 
-## Fonctionnalités
+## Features
 
-- Protocole MCP **2026-07-28** (sans session), compatible avec les clients plus anciens.
-- Mode **stateless** : plusieurs réplicas sans sessions sticky.
-- Validation des arguments contre le JSON Schema de l'outil cible, avant tout appel amont.
-- Relais transparent des résultats, de la progression, de l'annulation et des échanges
-  multi-tours (`input_required`).
-- Limites de concurrence globale et par serveur, avec délai d'attente borné.
-- Sondes de santé des amonts ; un amont en panne ne casse ni le catalogue ni les autres.
-- Logs JSON sur la sortie standard (Loki / Grafana) et métriques Prometheus.
-- `/health` (liveness), `/ready` (readiness) et arrêt propre pour Kubernetes.
+- MCP protocol **2026-07-28** (sessionless), compatible with older clients.
+- **Stateless** mode: several replicas without sticky sessions.
+- Arguments validated against the target tool's JSON Schema before any upstream call.
+- Transparent relaying of results, progress, cancellation and multi-turn exchanges
+  (`input_required`).
+- Global and per-server concurrency limits, with a bounded wait time.
+- Upstream health probes; a failing upstream breaks neither the catalog nor the others.
+- JSON logs on standard output (Loki / Grafana) and Prometheus metrics.
+- `/health` (liveness), `/ready` (readiness) and graceful shutdown for Kubernetes.
 
-## Démarrage rapide
+## Quick start
 
-Prérequis : Rust 1.88 ou plus récent (édition 2024). Aucune dépendance système : le TLS
-passe par rustls, sans OpenSSL.
+Requirements: Rust 1.88 or newer (2024 edition). No system dependency: TLS goes through
+rustls, without OpenSSL.
 
 ```bash
 cargo run -- --config registry.yaml
@@ -48,10 +47,10 @@ cargo run -- --config registry.yaml
 
 | Port | Routes |
 | --- | --- |
-| 8000 | `/mcp` (endpoint MCP), `/health`, `/ready` |
+| 8000 | `/mcp` (MCP endpoint), `/health`, `/ready` |
 | 9090 | `/metrics` (Prometheus) |
 
-Pour brancher la passerelle dans Claude Code :
+To plug the gateway into Claude Code:
 
 ```bash
 claude mcp add --transport http mcportal http://localhost:8000/mcp
@@ -59,8 +58,8 @@ claude mcp add --transport http mcportal http://localhost:8000/mcp
 
 ## Configuration
 
-Toute la configuration tient dans le registre YAML (chemin passé par `--config` ou la
-variable `MCPORTAL_CONFIG`). Exemple :
+The whole configuration lives in the YAML registry (path given by `--config` or the
+`MCPORTAL_CONFIG` variable). Example:
 
 ```yaml
 gateway:
@@ -73,80 +72,78 @@ gateway:
   http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
 
 servers:
-  - name: mcpdiffusion            # nom unique, sert aussi de préfixe d'outils
+  - name: mcpdiffusion            # unique name, also used as the tool prefix
     url: https://mcpdiffusion.lab.sspcloud.fr/mcp
-    transport: http               # http (sse : déprécié, non supporté)
+    transport: http               # http (sse: deprecated, not supported)
     domain: diffusion
-    description: Serveur pour exposer Melodi, Rmes et insee.fr
-    tags: [dataset, publications] # liste ou chaîne unique
-    enabled: true                 # false : visible dans le catalogue, non exposé
-    timeout: 30.0                 # délai par appel amont (s)
-    max_concurrency: 4            # appels simultanés vers ce serveur
-    cache_ttl: 300                # durée de vie du cache de la liste d'outils (s)
+    description: Server exposing Melodi, Rmes and insee.fr
+    tags: [dataset, publications] # list or single string
+    enabled: true                 # false: visible in the catalog, not exposed
+    timeout: 30.0                 # timeout per upstream call (s)
+    max_concurrency: 4            # concurrent calls to this server
+    cache_ttl: 300                # lifetime of the tool list cache (s)
 ```
 
-Chaque clé a une valeur par défaut ; elles sont toutes documentées dans
-[`src/config.rs`](src/config.rs). Une clé inconnue (faute de frappe) ou une valeur
-incohérente empêche le démarrage, avec un message explicite.
+Every key has a default value; they are all documented in
+[`src/config.rs`](src/config.rs). An unknown key (typo) or an inconsistent value prevents
+startup, with an explicit message.
 
-`guide_path` désigne le guide propre au déploiement : il est **relatif au registre**,
-vérifié au démarrage et relu à chaque lecture de `catalog://guide`.
+`guide_path` points to the deployment-specific guide: it is **relative to the registry**,
+checked at startup and re-read on every read of `catalog://guide`.
 
-La variable `RUST_LOG` est prioritaire sur `log_level` (ex. `RUST_LOG=mcportal=debug`).
+The `RUST_LOG` variable takes precedence over `log_level` (e.g. `RUST_LOG=mcportal=debug`).
 
-## Déploiement
+## Deployment
 
 ```bash
 docker build -t mcportal:0.1.0 .
 ```
 
-Un exemple Kubernetes (ConfigMap, Deployment, Service) est fourni dans
-[`deploy/kubernetes.yaml`](deploy/kubernetes.yaml). Points clés :
+A Kubernetes example (ConfigMap, Deployment, Service) is provided in
+[`deploy/kubernetes.yaml`](deploy/kubernetes.yaml). Key points:
 
-- le registre et le guide sont montés depuis un ConfigMap dans `/config` ;
-- un changement de config se déploie par **rolling update** (pas de rechargement à chaud) ;
-- `terminationGracePeriodSeconds` doit dépasser le plus grand `timeout` amont ;
-- le port 9090 (`/metrics`) ne doit pas être exposé par l'ingress.
+- the registry and the guide are mounted from a ConfigMap into `/config`;
+- a config change is deployed through a **rolling update** (no hot reload);
+- `terminationGracePeriodSeconds` must exceed the largest upstream `timeout`;
+- port 9090 (`/metrics`) must not be exposed by the ingress.
 
-## Tests et mesures
+## Tests and measurements
 
 ```bash
-cargo test                                   # tests unitaires et d'intégration (hors réseau)
-cargo test --test guide_drift -- --ignored   # cohérence du guide avec le registre et les vrais amonts
-cargo bench --bench overhead                 # overhead de la passerelle
+cargo test                                   # unit and integration tests (no network)
+cargo test --test guide_drift -- --ignored   # guide consistency with the registry and real upstreams
+cargo bench --bench overhead                 # gateway overhead
 ```
 
-Les tests d'intégration démarrent de vrais serveurs MCP simulés sur des ports aléatoires :
-ils n'ont besoin d'aucun service externe.
+Integration tests start real mock MCP servers on random ports: they need no external
+service.
 
-Overhead mesuré en local : environ **0,9 ms** par appel relayé, dû essentiellement au saut
-HTTP supplémentaire. En production, la métrique `mcportal_gateway_overhead_seconds` donne la
-même mesure.
+Overhead measured locally: about **0.9 ms** per relayed call, mostly due to the extra HTTP
+hop. In production, the `mcportal_gateway_overhead_seconds` metric gives the same
+measurement.
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) : organisation du code, fonctionnement interne et
-  décisions de conception.
-- [CONTRIBUTING.md](CONTRIBUTING.md) : comment contribuer.
-- [`src/guide.md`](src/guide.md) : guide d'utilisation servi aux clients MCP.
+- [ARCHITECTURE.md](ARCHITECTURE.md): code layout, internals and design decisions.
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to contribute.
+- [`src/guide.md`](src/guide.md): usage guide served to MCP clients.
 
-## Limites connues (V1)
+## Known limitations (V1)
 
-- Pas d'authentification ni de limite par utilisateur.
-- Pas de rechargement à chaud de la configuration.
-- Transport amont `sse` non supporté (déprécié par la spec MCP).
+- No authentication and no per-user limit.
+- No configuration hot reload.
+- Upstream `sse` transport not supported (deprecated by the MCP spec).
 
-Les raisons de ces choix sont détaillées dans
-[ARCHITECTURE.md](ARCHITECTURE.md#décisions-de-conception).
+The reasons for these choices are detailed in
+[ARCHITECTURE.md](ARCHITECTURE.md#design-decisions).
 
-## Contribuer
+## Contributing
 
-Les contributions sont les bienvenues : signalement de bug, idée d'évolution, documentation
-ou code.
+Contributions are welcome: bug reports, feature ideas, documentation or code.
 
-1. Ouvrez une issue pour décrire le bug ou discuter de l'évolution avant de vous lancer.
-2. Créez une branche à partir de `main` (`feat/…`, `fix/…`, `docs/…`).
-3. Vérifiez que tout passe :
+1. Open an issue to describe the bug or discuss the change before starting.
+2. Create a branch from `main` (`feat/…`, `fix/…`, `docs/…`).
+3. Check that everything passes:
 
    ```bash
    cargo fmt --all --check
@@ -154,11 +151,11 @@ ou code.
    cargo test
    ```
 
-4. Ouvrez une pull request vers `main`.
+4. Open a pull request against `main`.
 
-Le détail (conventions de code, messages de commit, tests, liste de contrôle) est dans
+The details (code conventions, commit messages, tests, checklist) are in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Licence
+## License
 
-Distribué sous licence [MIT](LICENSE).
+Distributed under the [MIT](LICENSE) license.

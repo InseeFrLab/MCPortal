@@ -1,59 +1,59 @@
-# Utiliser la passerelle MCP
+# Using the MCP gateway
 
-Cette passerelle agrège plusieurs serveurs MCP derrière une seule connexion. Ce guide décrit
-sa mécanique ; elle est la même quel que soit le déploiement.
+This gateway aggregates several MCP servers behind a single connection. This guide
+describes how it works; the mechanics are the same whatever the deployment.
 
-## Nommage des outils
+## Tool naming
 
-Chaque outil d'un serveur amont est exposé sous le nom `{serveur}_{outil}` : le nom du
-serveur sert de préfixe. C'est toujours ce nom complet qu'il faut utiliser pour appeler un
-outil, jamais le nom amont seul.
+Each tool of an upstream server is exposed under the name `{server}_{tool}`: the server
+name is used as a prefix. Always use this full name to call a tool, never the upstream
+name alone.
 
-## Trouver puis appeler un outil
+## Finding then calling a tool
 
-Quand la recherche d'outils est activée, la liste des outils (`tools/list`) ne montre pas les
-outils des serveurs amont, seulement trois outils de la passerelle :
+When tool search is enabled, the tool list (`tools/list`) does not show the upstream
+servers' tools, only three gateway tools:
 
-1. `search_tools(query)` : recherche plein texte (mots-clés, en français de préférence) dans
-   les noms, descriptions et paramètres de tous les outils. Chaque résultat donne le nom à
-   appeler et son `inputSchema` complet.
-2. `call_tool(name, arguments)` : appelle l'outil `name` (nom complet `{serveur}_{outil}`).
-   `arguments` est un **objet JSON** conforme à l'`inputSchema` renvoyé par la recherche,
-   pas une chaîne de caractères.
-3. `send_feedback(server, author, feedback)` : signale un problème ou une remarque sur un
-   serveur. Le message est consigné dans le journal de la passerelle.
+1. `search_tools(query)`: full-text search (keywords, preferably in the language of the
+   tool descriptions) across the names, descriptions and parameters of every tool. Each
+   result gives the name to call and its full `inputSchema`.
+2. `call_tool(name, arguments)`: calls the tool `name` (full name `{server}_{tool}`).
+   `arguments` is a **JSON object** matching the `inputSchema` returned by the search,
+   not a string.
+3. `send_feedback(server, author, feedback)`: reports a problem or a remark about a
+   server. The message is recorded in the gateway log.
 
-Démarche type : `search_tools` → choisir un résultat → `call_tool` avec ses arguments.
+Typical workflow: `search_tools` → pick a result → `call_tool` with its arguments.
 
-Quand la recherche d'outils est désactivée, les outils amont apparaissent directement dans
-`tools/list`, sous leur nom complet, et s'appellent normalement.
+When tool search is disabled, the upstream tools appear directly in `tools/list`, under
+their full name, and are called normally.
 
-## Le catalogue (ressources)
+## The catalog (resources)
 
-Le catalogue est exposé en ressources : le lire ne coûte rien tant qu'on ne le demande pas.
+The catalog is exposed as resources: reading it costs nothing until it is requested.
 
-| Ressource | Contenu |
+| Resource | Content |
 | --- | --- |
-| `catalog://servers` | tous les serveurs : domaine, description, tags, état, limites |
-| `catalog://domains` | serveurs regroupés par domaine fonctionnel |
-| `catalog://servers/{nom}` | détail d'un serveur et ses métriques (outils, sondes) |
-| `catalog://servers/{nom}/tools` | inventaire : nom amont, nom à appeler, description, paramètres |
-| `catalog://guide` | ce guide, suivi des démarches propres au déploiement |
+| `catalog://servers` | all servers: domain, description, tags, status, limits |
+| `catalog://domains` | servers grouped by functional domain |
+| `catalog://servers/{name}` | details of a server and its metrics (tools, probes) |
+| `catalog://servers/{name}/tools` | inventory: upstream name, name to call, description, parameters |
+| `catalog://guide` | this guide, followed by the deployment-specific workflows |
 
-Un serveur injoignable ne casse pas le catalogue : sa ressource répond
-`"status": "unavailable"` avec l'erreur.
+An unreachable server does not break the catalog: its resource responds with
+`"status": "unavailable"` and the error.
 
-## Pièges courants
+## Common pitfalls
 
-- **Ne devinez pas un nom d'outil** : cherchez-le avec `search_tools` ou lisez l'inventaire.
-  Un nom inconnu renvoie une erreur qui propose les noms proches.
-- **Arguments invalides** : la passerelle valide les arguments contre le schéma de l'outil
-  avant de l'appeler et renvoie le détail des erreurs. Corrigez et réessayez.
-- **Résultat en erreur** (`isError: true`) : l'appel a abouti mais l'outil a échoué ; le
-  message explique pourquoi. Ce n'est pas une panne de la passerelle.
-- **Passerelle ou serveur saturé** : le nombre d'appels simultanés est limité. Réessayez
-  quelques secondes plus tard plutôt que de multiplier les appels en parallèle.
-- **Serveur indisponible** : consultez `catalog://servers` pour son état ; utilisez un autre
-  serveur ou réessayez plus tard.
-- **Recherche vide** : reformulez avec d'autres mots-clés ou des synonymes ; la recherche
-  porte sur le texte des outils, pas sur les données qu'ils renvoient.
+- **Do not guess a tool name**: search for it with `search_tools` or read the inventory.
+  An unknown name returns an error that suggests close names.
+- **Invalid arguments**: the gateway validates the arguments against the tool's schema
+  before calling it and returns the detailed errors. Fix them and try again.
+- **Error result** (`isError: true`): the call went through but the tool failed; the
+  message explains why. This is not a gateway outage.
+- **Gateway or server saturated**: the number of concurrent calls is limited. Try again a
+  few seconds later rather than multiplying parallel calls.
+- **Server unavailable**: check `catalog://servers` for its status; use another server or
+  try again later.
+- **Empty search**: rephrase with other keywords or synonyms; the search covers the text
+  of the tools, not the data they return.

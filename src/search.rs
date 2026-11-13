@@ -1,58 +1,58 @@
-//! # Recherche d'outils (BM25)
+//! # Tool search (BM25)
 //!
-//! `search_tools` fait une recherche plein texte sur les outils de tous les amonts.
-//! On s'appuie sur le crate [`bm25`] (pur Rust, léger) plutôt que sur un moteur complet
-//! (tantivy, DuckDB) : il y a au plus quelques centaines d'outils, l'index se reconstruit en
-//! quelques millisecondes et tient en mémoire.
+//! `search_tools` runs a full-text search over the tools of every upstream.
+//! We rely on the [`bm25`] crate (pure Rust, lightweight) rather than a full engine
+//! (tantivy, DuckDB): there are at most a few hundred tools, the index is rebuilt in a few
+//! milliseconds and fits in memory.
 //!
-//! ## Ce qui fait la qualité de la recherche
+//! ## What makes search good
 //!
-//! La qualité dépend surtout du **document** indexé pour chaque outil ([`tool_document`]) :
+//! Quality mostly depends on the **document** indexed for each tool ([`tool_document`]):
 //!
-//! - le nom de l'outil **découpé** (`search_melodi_datasets` → « search melodi datasets »),
-//!   répété deux fois pour lui donner plus de poids (le « boost du pauvre » en BM25) ;
-//! - le nom, le domaine, les tags et la description **du serveur** : une recherche sur un
-//!   domaine (« diffusion ») trouve ainsi les outils du serveur correspondant ;
-//! - la description de l'outil ;
-//! - les noms et descriptions de ses **paramètres** (`geo_level`, `dataset_id`…).
+//! - the tool name, **split** (`search_melodi_datasets` → "search melodi datasets"),
+//!   repeated twice to give it more weight (the "poor man's boost" in BM25);
+//! - the **server's** name, domain, tags and description: a search on a domain
+//!   ("diffusion") thus finds the tools of the matching server;
+//! - the tool's description;
+//! - the names and descriptions of its **parameters** (`geo_level`, `dataset_id`…).
 //!
-//! Le tokenizer est réglé pour le français : suppression des accents, mots vides
-//! (« le », « des »…) et racinisation (« publications » et « publication » se rejoignent).
+//! The tokenizer is tuned for French, the language of the current upstreams: accents
+//! removed, stop words ("le", "des"…) and stemming ("publications" and "publication" match).
 //!
-//! ## Pourquoi un trait ?
+//! ## Why a trait?
 //!
-//! [`ToolIndex`] isole la recherche du reste de la passerelle. Ce module ne dépend que de
-//! `rmcp::model::Tool` : il pourra être extrait tel quel (crate séparé ou PR dans rmcp).
+//! [`ToolIndex`] isolates search from the rest of the gateway. This module depends only on
+//! `rmcp::model::Tool`: it can be extracted as is (separate crate or PR to rmcp).
 
 use bm25::{Document, Language, LanguageMode, SearchEngine, SearchEngineBuilder};
 use rmcp::model::Tool;
 
-/// Un résultat de recherche : le nom exposé de l'outil et son score BM25.
+/// A search result: the tool's exposed name and its BM25 score.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredTool {
     pub name: String,
     pub score: f32,
 }
 
-/// Interface minimale d'un index de recherche d'outils.
+/// Minimal interface of a tool search index.
 pub trait ToolIndex: Send + Sync {
-    /// Renvoie au plus `limit` outils, du plus pertinent au moins pertinent.
+    /// Returns at most `limit` tools, from most to least relevant.
     fn search(&self, query: &str, limit: usize) -> Vec<ScoredTool>;
 }
 
-/// Ce que l'on sait d'un outil au moment de l'indexer.
+/// What we know about a tool when indexing it.
 pub struct IndexEntry<'a> {
-    /// Nom exposé par la passerelle (`{serveur}_{outil}`), utilisé comme identifiant.
+    /// Name exposed by the gateway (`{server}_{tool}`), used as the identifier.
     pub exposed_name: &'a str,
     pub tool: &'a Tool,
-    /// Texte décrivant le serveur (nom, domaine, tags, description).
+    /// Text describing the server (name, domain, tags, description).
     pub server_text: &'a str,
 }
 
-/// Index BM25 construit une fois pour toutes (immuable) à partir d'une liste d'outils.
+/// BM25 index built once and for all (immutable) from a list of tools.
 pub struct Bm25ToolIndex {
-    /// Les identifiants de documents sont des indices dans `names` (un entier est plus
-    /// efficace qu'une chaîne pour le crate bm25).
+    /// Document identifiers are indices into `names` (an integer is more efficient than a
+    /// string for the bm25 crate).
     engine: SearchEngine<usize>,
     names: Vec<String>,
 }
@@ -76,7 +76,7 @@ impl Bm25ToolIndex {
 
 impl ToolIndex for Bm25ToolIndex {
     fn search(&self, query: &str, limit: usize) -> Vec<ScoredTool> {
-        // La requête subit le même pré-traitement que les documents (découpage des `_`).
+        // The query goes through the same preprocessing as the documents (splitting on `_`).
         self.engine
             .search(&split_identifiers(query), limit)
             .into_iter()
@@ -88,12 +88,12 @@ impl ToolIndex for Bm25ToolIndex {
     }
 }
 
-/// Construit le texte indexé pour un outil. Voir la documentation du module.
+/// Builds the indexed text for a tool. See the module documentation.
 pub fn tool_document(entry: &IndexEntry<'_>) -> String {
     let tool = entry.tool;
     let mut parts: Vec<String> = Vec::new();
 
-    // Nom exposé, deux fois (boost) : il contient le préfixe serveur et le nom amont.
+    // Exposed name, twice (boost): it contains the server prefix and the upstream name.
     parts.push(entry.exposed_name.to_owned());
     parts.push(entry.exposed_name.to_owned());
     if let Some(title) = &tool.title {
@@ -104,7 +104,7 @@ pub fn tool_document(entry: &IndexEntry<'_>) -> String {
         parts.push(description.to_string());
     }
 
-    // Paramètres : `inputSchema.properties.{nom}.description`.
+    // Parameters: `inputSchema.properties.{name}.description`.
     if let Some(serde_json::Value::Object(props)) = tool.input_schema.get("properties") {
         for (param, schema) in props {
             parts.push(param.clone());
@@ -117,8 +117,8 @@ pub fn tool_document(entry: &IndexEntry<'_>) -> String {
     split_identifiers(&parts.join("\n"))
 }
 
-/// Remplace `_` et `-` par des espaces : le découpage Unicode des mots considère
-/// `search_melodi_datasets` comme **un seul** mot, ce qui rendrait « melodi » introuvable.
+/// Replaces `_` and `-` with spaces: Unicode word segmentation treats
+/// `search_melodi_datasets` as **a single** word, which would make "melodi" unfindable.
 fn split_identifiers(text: &str) -> String {
     text.replace(['_', '-'], " ")
 }
@@ -136,6 +136,7 @@ mod tests {
         Tool::new(name.to_owned(), description.to_owned(), Arc::new(schema))
     }
 
+    // French test data on purpose: it exercises the French tokenizer.
     fn index() -> Bm25ToolIndex {
         let geocode = tool(
             "geocode",
@@ -173,21 +174,21 @@ mod tests {
 
     #[test]
     fn finds_tool_by_word_inside_identifier() {
-        // « melodi » n'apparaît que dans des identifiants avec `_` : le découpage est essentiel.
+        // "melodi" only appears in identifiers with `_`: splitting is essential.
         let hits = index().search("melodi", 5);
         assert_eq!(hits[0].name, "melodi_search_melodi_datasets");
     }
 
     #[test]
     fn ignores_accents_and_plural() {
-        // « donnees » sans accent et au pluriel doit trouver « données ».
+        // "donnees" without accent and in the plural must find "données".
         let hits = index().search("jeu de donnees statistique", 5);
         assert_eq!(hits[0].name, "melodi_search_melodi_datasets");
     }
 
     #[test]
     fn finds_tool_by_server_domain() {
-        // Le domaine du serveur est indexé : « géographie » remonte les outils geodata.
+        // The server's domain is indexed: "géographie" brings up the geodata tools.
         let hits = index().search("géographie", 5);
         assert!(
             hits.iter().all(|h| h.name.starts_with("geodata_")),

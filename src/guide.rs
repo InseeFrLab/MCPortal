@@ -1,37 +1,37 @@
-//! # Le guide (`catalog://guide`)
+//! # The guide (`catalog://guide`)
 //!
-//! Le guide est composé de deux couches, servies dans une seule ressource :
+//! The guide is made of two layers, served in a single resource:
 //!
-//! 1. **la mécanique** ([`MECHANICS`], fichier `src/guide.md`) : embarquée dans le binaire à
-//!    la compilation (`include_str!`). Elle ne cite aucun serveur ni outil du déploiement ;
-//!    une nouvelle version du binaire la met à jour ;
-//! 2. **les démarches du déploiement** (`gateway.catalog.guide_path`) : relues sur le disque
-//!    **à chaque lecture** de la ressource, donc modifiables sans redémarrage (ConfigMap).
+//! 1. **the mechanics** ([`MECHANICS`], file `src/guide.md`): embedded in the binary at
+//!    compile time (`include_str!`). It cites no deployment server or tool; a new version
+//!    of the binary updates it;
+//! 2. **the deployment workflows** (`gateway.catalog.guide_path`): re-read from disk **on
+//!    every read** of the resource, so they can be changed without a restart (ConfigMap).
 //!
-//! ## Garde-fous contre la dérive du guide de déploiement
+//! ## Guards against deployment guide drift
 //!
-//! Le guide de déploiement cite des serveurs et des outils réels. Pour éviter qu'il ne
-//! dérive du registre, ce module sait extraire ces citations ([`citations`]) :
+//! The deployment guide cites real servers and tools. To keep it from drifting away from
+//! the registry, this module can extract these citations ([`citations`]):
 //!
-//! - [`check_against_registry`] (test hermétique) : chaque serveur cité doit être activé ;
-//! - [`cited_upstream_tools`] (test d'intégration réseau) : chaque outil cité doit exister
-//!   dans l'inventaire réel de son amont.
+//! - [`check_against_registry`] (hermetic test): every cited server must be enabled;
+//! - [`cited_upstream_tools`] (network integration test): every cited tool must exist in
+//!   the real inventory of its upstream.
 //!
-//! Une citation est un passage entre accents graves (`` `…` ``) :
-//! - `serveur_outil(…)` ou `serveur_outil` → un outil ;
-//! - `catalog://servers/{nom}…` → un serveur.
+//! A citation is a backtick-quoted span (`` `…` ``):
+//! - `server_tool(…)` or `server_tool` → a tool;
+//! - `catalog://servers/{name}…` → a server.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::Config;
 
-/// Guide générique, compilé dans le binaire.
+/// Generic guide, compiled into the binary.
 pub const MECHANICS: &str = include_str!("guide.md");
 
-/// Outils propres à la passerelle (pas de serveur amont derrière).
+/// The gateway's own tools (no upstream server behind them).
 pub const GATEWAY_TOOLS: &[&str] = &["search_tools", "call_tool", "send_feedback"];
 
-/// Assemble le guide complet : mécanique, séparateur, puis guide de déploiement (s'il existe).
+/// Assembles the full guide: mechanics, separator, then the deployment guide (if any).
 pub async fn render(config: &Config) -> std::io::Result<String> {
     let mut text = MECHANICS.to_owned();
     if let Some(path) = &config.gateway.catalog.guide_path {
@@ -42,20 +42,20 @@ pub async fn render(config: &Config) -> std::io::Result<String> {
     Ok(text)
 }
 
-/// Une citation trouvée dans le guide.
+/// A citation found in the guide.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Citation {
-    /// Identifiant entre accents graves (ex. `insee_get_insee_document`).
-    /// `is_call` = suivi d'une parenthèse (`geodata_geocode(text=…)`).
+    /// Backtick-quoted identifier (e.g. `insee_get_insee_document`).
+    /// `is_call` = followed by a parenthesis (`geodata_geocode(text=…)`).
     Identifier { token: String, is_call: bool },
-    /// `catalog://servers/{nom}…`
+    /// `catalog://servers/{name}…`
     CatalogServer(String),
 }
 
-/// Extrait les citations des passages de code (entre accents graves).
+/// Extracts citations from code spans (between backticks).
 pub fn citations(text: &str) -> Vec<Citation> {
     let mut found = Vec::new();
-    // Découper sur '`' : les segments d'indice impair sont à l'intérieur d'un passage de code.
+    // Split on '`': odd-indexed segments are inside a code span.
     for span in text.split('`').skip(1).step_by(2) {
         if let Some(rest) = span.strip_prefix("catalog://servers/") {
             let name: String = rest.chars().take_while(|c| *c != '/').collect();
@@ -77,8 +77,8 @@ pub fn citations(text: &str) -> Vec<Citation> {
     found
 }
 
-/// Trouve le serveur du registre dont `token` porte le préfixe (`{serveur}_…`).
-/// En cas de préfixes imbriqués (`a` et `a_b`), le plus long gagne.
+/// Finds the registry server whose name is the prefix of `token` (`{server}_…`).
+/// With nested prefixes (`a` and `a_b`), the longest wins.
 fn server_prefix<'a>(token: &str, config: &'a Config) -> Option<&'a str> {
     config
         .servers
@@ -88,8 +88,8 @@ fn server_prefix<'a>(token: &str, config: &'a Config) -> Option<&'a str> {
         .max_by_key(|name| name.len())
 }
 
-/// Vérifie que chaque serveur cité par le guide est déclaré **et activé** dans le registre.
-/// Renvoie la liste des problèmes (vide = tout va bien).
+/// Checks that every server cited by the guide is declared **and enabled** in the registry.
+/// Returns the list of problems (empty = all good).
 pub fn check_against_registry(text: &str, config: &Config) -> Vec<String> {
     let enabled = |name: &str| config.servers.iter().any(|s| s.name == name && s.enabled);
     let declared = |name: &str| config.servers.iter().any(|s| s.name == name);
@@ -100,7 +100,7 @@ pub fn check_against_registry(text: &str, config: &Config) -> Vec<String> {
             Citation::CatalogServer(name) => {
                 if !enabled(&name) {
                     problems.insert(format!(
-                        "serveur '{name}' cité (catalog://) mais absent ou désactivé"
+                        "server '{name}' cited (catalog://) but missing or disabled"
                     ));
                 }
             }
@@ -110,18 +110,20 @@ pub fn check_against_registry(text: &str, config: &Config) -> Vec<String> {
                 }
                 if let Some(server) = server_prefix(&token, config) {
                     if !enabled(server) {
-                        problems.insert(format!("outil '{token}' : serveur '{server}' désactivé"));
+                        problems.insert(format!("tool '{token}': server '{server}' disabled"));
                     }
                 } else if is_call {
-                    // Un appel `x_y(…)` sans préfixe connu : serveur inconnu du registre.
+                    // A call `x_y(…)` without a known prefix: server unknown to the registry.
                     problems.insert(format!(
-                        "outil '{token}' : aucun serveur du registre ne porte ce préfixe"
+                        "tool '{token}': no registry server has this prefix"
                     ));
                 } else if token.chars().all(|c| c.is_ascii_lowercase() || c == '-')
                     && !declared(&token)
                     && looks_like_server_row(text, &token)
                 {
-                    problems.insert(format!("serveur '{token}' cité mais absent du registre"));
+                    problems.insert(format!(
+                        "server '{token}' cited but missing from the registry"
+                    ));
                 }
             }
         }
@@ -129,15 +131,15 @@ pub fn check_against_registry(text: &str, config: &Config) -> Vec<String> {
     problems.into_iter().collect()
 }
 
-/// Heuristique : un mot seul est un nom de serveur s'il ouvre une ligne de tableau
-/// (`| `insee` | …`), forme utilisée par les guides pour présenter les serveurs.
+/// Heuristic: a single word is a server name if it opens a table row
+/// (`| `insee` | …`), the form guides use to present servers.
 fn looks_like_server_row(text: &str, token: &str) -> bool {
     let cell = format!("| `{token}` |");
     text.lines()
         .any(|line| line.trim_start().starts_with(&cell))
 }
 
-/// Outils amont cités par le guide, par serveur (nom amont, sans préfixe).
+/// Upstream tools cited by the guide, per server (upstream name, without prefix).
 pub fn cited_upstream_tools(text: &str, config: &Config) -> BTreeMap<String, BTreeSet<String>> {
     let mut by_server: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for citation in citations(text) {
@@ -170,7 +172,7 @@ servers:
 
     #[test]
     fn mechanics_guide_cites_no_deployment_server() {
-        // La mécanique doit rester vraie quel que soit le registre.
+        // The mechanics must hold whatever the registry.
         let empty = Config::from_yaml("gateway: {name: T}").unwrap();
         assert!(check_against_registry(MECHANICS, &empty).is_empty());
         assert!(cited_upstream_tools(MECHANICS, &registry()).is_empty());
@@ -178,7 +180,7 @@ servers:
 
     #[test]
     fn extracts_calls_identifiers_and_catalog_uris() {
-        let text = "Appelez `geodata_geocode(text=\"Paris\")` puis `insee_search`. Voir `catalog://servers/insee/tools` et `catalog://servers/{nom}`.";
+        let text = "Call `geodata_geocode(text=\"Paris\")` then `insee_search`. See `catalog://servers/insee/tools` and `catalog://servers/{name}`.";
         assert_eq!(
             citations(text),
             vec![

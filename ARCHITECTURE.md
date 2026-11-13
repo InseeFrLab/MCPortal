@@ -1,254 +1,254 @@
-# Architecture de MCPortal
+# MCPortal architecture
 
-Ce document décrit l'organisation du code et le fonctionnement interne de la passerelle.
-Pour l'utilisation, voir le [README](README.md). Les choix de conception et leur
-justification sont regroupés à la fin, dans [Décisions de conception](#décisions-de-conception).
+This document describes the code layout and the internals of the gateway. For usage, see
+the [README](README.md). Design choices and their rationale are grouped at the end, in
+[Design decisions](#design-decisions).
 
-Principe directeur : **la simplicité avant tout**. Un seul crate, un état partagé immuable,
-pas de verrou sur le chemin des requêtes, et le protocole MCP délégué au SDK officiel
+Guiding principle: **simplicity first**. A single crate, an immutable shared state, no lock
+on the request path, and the MCP protocol delegated to the official SDK
 [`rmcp`](https://crates.io/crates/rmcp).
 
-## Vue d'ensemble
+## Overview
 
 ```text
                        ┌──────────────────────── MCPortal ────────────────────────┐
                        │                                                          │
- client MCP ──HTTP──▶  │  server.rs ──▶ gateway.rs (ServerHandler rmcp)            │
- (aval)       :8000    │  /mcp /health    ├─ search_tools ──▶ search.rs (BM25)      │
+ MCP client ──HTTP──▶  │  server.rs ──▶ gateway.rs (rmcp ServerHandler)            │
+ (downstream) :8000    │  /mcp /health    ├─ search_tools ──▶ search.rs (BM25)      │
                        │  /ready          ├─ call_tool ─────▶ limits.rs ──┐         │
                        │                  ├─ send_feedback ─▶ logs        │         │
                        │                  └─ resources ─────▶ catalog.rs  │         │
                        │                                      guide.rs    ▼         │
-                       │  state.rs  AppState ─────────────────────▶ upstream.rs ───┼──HTTP──▶ amonts
-                       │   ├─ config (fixe)                         (client rmcp)  │
-                       │   ├─ upstreams (fixes)                                    │
-                       │   └─ catalog: ArcSwap<ToolCatalog>  ◀── boucle de        │
-                       │                                         rafraîchissement  │
+                       │  state.rs  AppState ─────────────────────▶ upstream.rs ───┼──HTTP──▶ upstreams
+                       │   ├─ config (fixed)                        (rmcp client)  │
+                       │   ├─ upstreams (fixed)                                    │
+                       │   └─ catalog: ArcSwap<ToolCatalog>  ◀── refresh          │
+                       │                                         loop              │
  Prometheus ──HTTP──▶  │  /metrics :9090  ◀── telemetry.rs                         │
                        └──────────────────────────────────────────────────────────┘
 ```
 
-## Arborescence
+## Layout
 
 ```text
 .
 ├── Cargo.toml
-├── registry.yaml            registre de démonstration
-├── guide-ssp.md             guide propre au déploiement (servi après le guide générique)
+├── registry.yaml            demo registry
+├── guide-ssp.md             deployment-specific guide (served after the generic guide)
 ├── src/
-│   ├── main.rs              binaire : lit la config, installe logs et métriques, lance server::serve
-│   ├── lib.rs               racine de la bibliothèque, ordre de lecture conseillé
-│   ├── config.rs            types du registre YAML + validation (pur, sans réseau)
-│   ├── upstream.rs          un serveur amont : connexion, appels, santé, cache d'outils
-│   ├── state.rs             AppState, catalogue d'outils, boucle de rafraîchissement
-│   ├── search.rs            index BM25 (trait ToolIndex)
-│   ├── gateway.rs           serveur MCP exposé : outils et ressources
-│   ├── catalog.rs           contenu JSON des ressources catalog://…
-│   ├── guide.rs             assemblage du guide + garde-fous contre sa dérive
-│   ├── guide.md             guide générique, compilé dans le binaire
-│   ├── limits.rs            sémaphores de concurrence
-│   ├── server.rs            routeurs axum, /health, /ready, /metrics, arrêt propre
-│   └── telemetry.rs         logs tracing (JSON) + export Prometheus, noms des métriques
+│   ├── main.rs              binary: reads the config, sets up logs and metrics, runs server::serve
+│   ├── lib.rs               library root, suggested reading order
+│   ├── config.rs            YAML registry types + validation (pure, no network)
+│   ├── upstream.rs          one upstream server: connection, calls, health, tool cache
+│   ├── state.rs             AppState, tool catalog, refresh loop
+│   ├── search.rs            BM25 index (ToolIndex trait)
+│   ├── gateway.rs           exposed MCP server: tools and resources
+│   ├── catalog.rs           JSON content of the catalog://… resources
+│   ├── guide.rs             guide assembly + guards against drift
+│   ├── guide.md             generic guide, compiled into the binary
+│   ├── limits.rs            concurrency semaphores
+│   ├── server.rs            axum routers, /health, /ready, /metrics, graceful shutdown
+│   └── telemetry.rs         tracing logs (JSON) + Prometheus export, metric names
 ├── tests/
-│   ├── common/mod.rs        amont MCP simulé, démarrage de passerelle, client de test
-│   ├── gateway.rs           tests de bout en bout (client → passerelle → amont simulé)
-│   └── guide_drift.rs       cohérence du guide de déploiement avec le registre réel
-├── benches/overhead.rs      mesure de l'overhead (criterion)
-├── deploy/kubernetes.yaml   exemple de déploiement
+│   ├── common/mod.rs        mock MCP upstream, gateway startup, test client
+│   ├── gateway.rs           end-to-end tests (client → gateway → mock upstream)
+│   └── guide_drift.rs       consistency of the deployment guide with the real registry
+├── benches/overhead.rs      overhead measurement (criterion)
+├── deploy/kubernetes.yaml   deployment example
 └── Dockerfile
 ```
 
-Toute la logique vit dans la **bibliothèque** (`src/lib.rs`) ; `main.rs` ne fait
-qu'assembler. C'est ce qui permet aux tests et au benchmark de démarrer une vraie
-passerelle en mémoire.
+All the logic lives in the **library** (`src/lib.rs`); `main.rs` only wires things
+together. This is what lets the tests and the benchmark start a real in-memory gateway.
 
-## Les modules
+## Modules
 
-### `config` : le registre
+### `config`: the registry
 
-Types `serde` du fichier YAML (`Config`, `GatewayConfig`, `UpstreamConfig`…) avec
-`deny_unknown_fields` et une valeur par défaut pour chaque clé. `Config::load` résout
-`guide_path` par rapport au fichier de registre et vérifie qu'il existe. `Config::from_yaml`
-permet de tester sans toucher au disque.
+`serde` types for the YAML file (`Config`, `GatewayConfig`, `UpstreamConfig`…) with
+`deny_unknown_fields` and a default value for every key. `Config::load` resolves
+`guide_path` relative to the registry file and checks that it exists. `Config::from_yaml`
+allows testing without touching the disk.
 
-### `upstream` : parler à un serveur amont
+### `upstream`: talking to an upstream server
 
-Un `Upstream` par serveur du registre. Il contient :
+One `Upstream` per registry server. It holds:
 
-- **une connexion rmcp partagée** par tous les utilisateurs. En Streamable HTTP, chaque appel
-  est un POST indépendant : un seul client suffit pour des appels concurrents. La connexion
-  est ouverte au premier besoin et refaite si le transport se ferme ;
-- **un sémaphore** de `max_concurrency` places ;
-- **l'état de santé** (échecs consécutifs, dernière erreur, horodatages) et des compteurs ;
-- **le cache de la liste d'outils**, daté pour respecter `cache_ttl`.
+- **one rmcp connection shared** by all users. With Streamable HTTP, every call is an
+  independent POST: a single client is enough for concurrent calls. The connection is
+  opened when first needed and reopened if the transport closes;
+- **a semaphore** with `max_concurrency` permits;
+- **the health state** (consecutive failures, last error, timestamps) and counters;
+- **the tool list cache**, timestamped to honor `cache_ttl`.
 
-La version du protocole est négociée en mode `Auto` : `server/discover` (2026-07-28) d'abord,
-puis repli sur `initialize` pour les amonts plus anciens.
+The protocol version is negotiated in `Auto` mode: `server/discover` (2026-07-28) first,
+then a fallback to `initialize` for older upstreams.
 
-Toutes les erreurs amont sont traduites en `UpstreamError` (`Unavailable`, `Timeout`,
-`Protocol`). Une erreur de transport invalide la connexion, qui sera refaite à l'appel
-suivant.
+Every upstream error is translated into an `UpstreamError` (`Unavailable`, `Timeout`,
+`Protocol`). A transport error invalidates the connection, which is reopened on the next
+call.
 
-### `state` : l'état partagé
+### `state`: the shared state
 
-`AppState` est créé une fois et partagé par `Arc`. Il sépare :
+`AppState` is created once and shared through an `Arc`. It separates:
 
-| Donnée | Durée de vie | Accès |
+| Data | Lifetime | Access |
 | --- | --- | --- |
-| `config`, `upstreams`, `limits` | vie du pod | lecture directe |
-| `catalog: ArcSwap<ToolCatalog>` | remplacé quand un amont change ses outils | `load()` sans verrou |
-| `ready: AtomicBool` | change au démarrage et à l'arrêt | atomique |
+| `config`, `upstreams`, `limits` | pod lifetime | direct read |
+| `catalog: ArcSwap<ToolCatalog>` | replaced when an upstream changes its tools | lock-free `load()` |
+| `ready: AtomicBool` | changes at startup and shutdown | atomic |
 
-Le `ToolCatalog` est **immuable** : la table `nom exposé → ToolEntry` (en `BTreeMap`, pour un
-`tools/list` à l'ordre déterministe) et l'index BM25. Chaque `ToolEntry` porte la définition
-exposée (renommée en `{serveur}_{outil}`), le nom amont et le validateur JSON Schema
-compilé.
+The `ToolCatalog` is **immutable**: the `exposed name → ToolEntry` table (a `BTreeMap`, for
+a deterministic `tools/list` order) and the BM25 index. Each `ToolEntry` holds the exposed
+definition (renamed to `{server}_{tool}`), the upstream name and the compiled JSON Schema
+validator.
 
-Pour changer le catalogue, `rebuild_catalog` en construit un nouveau à côté, puis le publie
-d'un coup avec `store()`. Les requêtes en cours gardent l'ancienne version jusqu'à leur fin :
-aucune ne voit un catalogue à moitié construit. Un verrou sérialise les reconstructions,
-pour qu'une version périmée ne soit jamais publiée après une plus récente.
+To change the catalog, `rebuild_catalog` builds a new one alongside, then publishes it in
+one go with `store()`. In-flight requests keep the old version until they finish: none of
+them sees a half-built catalog. A lock serializes rebuilds, so that a stale version is
+never published after a newer one.
 
-### `search` : la recherche BM25
+### `search`: BM25 search
 
-`Bm25ToolIndex` s'appuie sur le crate `bm25` avec un tokenizer français (accents retirés, mots
-vides, racinisation). La qualité vient surtout du document indexé pour chaque outil :
+`Bm25ToolIndex` relies on the `bm25` crate with a French tokenizer (accents removed, stop
+words, stemming). Quality mostly comes from the document indexed for each tool:
 
-- le nom exposé, découpé sur `_` et répété (pour lui donner plus de poids) ;
-- le nom, le domaine, les tags et la description du serveur ;
-- la description de l'outil ;
-- les noms et descriptions de ses paramètres.
+- the exposed name, split on `_` and repeated (to give it more weight);
+- the server's name, domain, tags and description;
+- the tool's description;
+- the names and descriptions of its parameters.
 
-Le module ne dépend que de `rmcp::model::Tool`, derrière le trait `ToolIndex`, pour pouvoir
-être extrait (crate séparé ou contribution à rmcp).
+The module depends only on `rmcp::model::Tool`, behind the `ToolIndex` trait, so it can be
+extracted (separate crate or contribution to rmcp).
 
-### `gateway` : le serveur MCP exposé
+### `gateway`: the exposed MCP server
 
-`Gateway` implémente `ServerHandler` **à la main** plutôt qu'avec les macros `#[tool]`, parce
-que la liste des outils dépend des amonts. Les arguments des outils de la passerelle sont des
-structures `serde` + `schemars` (`SearchToolsArgs`, `CallToolArgs`, `SendFeedbackArgs`) ; leurs
-commentaires `///` deviennent les descriptions du JSON Schema vu par le LLM.
+`Gateway` implements `ServerHandler` **by hand** rather than with the `#[tool]` macros,
+because the tool list depends on the upstreams. The arguments of the gateway's tools are
+`serde` + `schemars` structs (`SearchToolsArgs`, `CallToolArgs`, `SendFeedbackArgs`); their
+`///` comments become the JSON Schema descriptions seen by the LLM.
 
-`CallToolArgs` reprend exactement la forme du protocole (`name` + `arguments` en objet JSON) :
-les arguments de l'outil cible ne sont connus qu'à l'exécution, on ne les type pas.
+`CallToolArgs` mirrors the protocol shape exactly (`name` + `arguments` as a JSON object):
+the target tool's arguments are only known at runtime, so they are not typed.
 
-### `catalog` et `guide` : les ressources
+### `catalog` and `guide`: the resources
 
-`catalog.rs` produit le JSON des ressources à partir de l'état courant, à chaque lecture : il
-n'existe aucune seconde source de vérité. `guide.rs` assemble `catalog://guide` : le guide
-générique (`src/guide.md`, compilé dans le binaire), puis le guide de déploiement relu sur
-le disque. Il sait aussi extraire les serveurs et outils cités par un guide, ce qu'utilisent
-les tests de dérive.
+`catalog.rs` produces the resources' JSON from the current state, on every read: there is
+no second source of truth. `guide.rs` assembles `catalog://guide`: the generic guide
+(`src/guide.md`, compiled into the binary), then the deployment guide re-read from disk. It
+can also extract the servers and tools cited by a guide, which the drift tests use.
 
-### `limits` : la concurrence
+### `limits`: concurrency
 
-Deux sémaphores acquis dans l'ordre **global puis serveur**, avec un seul délai pour les deux.
-Les places sont rendues automatiquement à la destruction du `CallPermit`, y compris en cas
-d'erreur ou d'annulation. Au-delà du délai, l'appel est refusé avec un message lisible.
+Two semaphores acquired in **global then server** order, with a single timeout for both.
+Permits are released automatically when the `CallPermit` is dropped, including on error or
+cancellation. Past the timeout, the call is rejected with a readable message.
 
-### `server` et `main` : HTTP et cycle de vie
+### `server` and `main`: HTTP and lifecycle
 
-`router()` monte le service MCP de rmcp sur `gateway.http.path`, avec :
+`router()` mounts rmcp's MCP service on `gateway.http.path`, with:
 
-- `legacy_session_mode(false)` : toutes les requêtes sont traitées sans session ;
-- `json_response(true)` : réponse JSON simple quand l'outil n'émet pas de notification
-  (rmcp repasse en SSE sinon) ;
-- un contrôle de l'en-tête `Host` désactivé par défaut (adapté derrière un ingress).
+- `legacy_session_mode(false)`: every request is handled without a session;
+- `json_response(true)`: plain JSON response when the tool emits no notification (rmcp
+  switches back to SSE otherwise);
+- a `Host` header check, disabled by default (suited to running behind an ingress).
 
-`serve()` lance les tâches de fond (premier chargement, rafraîchissement, port métriques) et
-gère l'arrêt.
+`serve()` starts the background tasks (initial load, refresh, metrics port) and handles
+shutdown.
 
-### `telemetry` : logs et métriques
+### `telemetry`: logs and metrics
 
-Logs `tracing` sur la sortie standard, en JSON aplati. Métriques via la façade `metrics`,
-agrégées par l'enregistreur Prometheus. Tous les noms de métriques sont regroupés dans
+`tracing` logs on standard output, as flattened JSON. Metrics through the `metrics` facade,
+aggregated by the Prometheus recorder. All metric names are grouped in
 `telemetry::metric`.
 
-## Cycle de vie d'un appel `call_tool`
+## Lifecycle of a `call_tool` call
 
 ```text
 client ──tools/call {name: "call_tool", arguments: {name, arguments}}──▶ rmcp ──▶ Gateway::call_tool
-  1. parse CallToolArgs                     échec → erreur JSON-RPC invalid_params
-  2. catalog.load()                         lecture sans verrou de la version courante
-  3. résolution du nom exposé               inconnu → isError + noms proches (BM25)
-  4. validation JSON Schema                 invalide → isError + liste des erreurs
-  5. limits.acquire (global puis serveur)   délai dépassé → isError « saturé »
-  6. upstream.call_tool                     timeout, annulation, relais de progression
-  7. résultat amont renvoyé tel quel        erreur amont → isError lisible
-  8. métriques + log « appel d'outil »
+  1. parse CallToolArgs                     failure → JSON-RPC invalid_params error
+  2. catalog.load()                         lock-free read of the current version
+  3. resolve the exposed name               unknown → isError + close names (BM25)
+  4. JSON Schema validation                 invalid → isError + list of errors
+  5. limits.acquire (global then server)    timeout exceeded → isError "saturated"
+  6. upstream.call_tool                     timeout, cancellation, progress relay
+  7. upstream result returned as is         upstream error → readable isError
+  8. metrics + "tool call" log
 ```
 
-Le résultat amont (`content`, `structuredContent`, `isError`, `_meta`) n'est jamais
-réemballé : images, ressources embarquées et contenu structuré traversent intacts.
+The upstream result (`content`, `structuredContent`, `isError`, `_meta`) is never
+re-wrapped: images, embedded resources and structured content go through untouched.
 
-### Deux niveaux d'erreur
+### Two levels of error
 
-| Situation | Réponse |
+| Situation | Response |
 | --- | --- |
-| Requête mal formée (arguments de nos outils non désérialisables) | erreur JSON-RPC |
-| Tout ce que le LLM peut corriger ou contourner : outil inconnu, arguments invalides, saturation, amont injoignable, timeout, erreur de l'outil | `CallToolResult` avec `isError: true` et un message actionnable |
+| Malformed request (arguments of our tools cannot be deserialized) | JSON-RPC error |
+| Anything the LLM can fix or work around: unknown tool, invalid arguments, saturation, unreachable upstream, timeout, tool error | `CallToolResult` with `isError: true` and an actionable message |
 
-C'est la recommandation de la spec MCP : les clients affichent souvent les erreurs JSON-RPC de
-façon opaque, alors qu'un `isError` est lu par le LLM.
+This is what the MCP spec recommends: clients often display JSON-RPC errors opaquely,
+whereas an `isError` is read by the LLM.
 
-### Relais vers l'amont : points délicats
+### Relaying to the upstream: tricky points
 
-- **Annulation** : si le client aval annule (`context.ct`) ou si le timeout expire, le
-  future de l'appel est abandonné et `notifications/cancelled` part vers l'amont.
-- **Progression** : le client rmcp impose son propre `progressToken` à chaque requête (un
-  compteur par connexion). On envoie donc la requête, on lit le jeton choisi
-  (`RequestHandle::progress_token`), puis on enregistre la route « jeton amont → client aval »
-  dans le `ProgressRouter` **de cette connexion**. Une notification arrivée avant
-  l'enregistrement est conservée et relayée ensuite. Le client aval reçoit son propre jeton.
-- **Échanges multi-tours (MRTR)** : un `InputRequiredResult` amont est renvoyé tel quel au
-  client aval. Quand celui-ci rappelle `call_tool` avec `inputResponses` / `requestState`, ces
-  champs sont retransmis à l'amont. La passerelle ne garde aucun état entre les tours.
+- **Cancellation**: if the downstream client cancels (`context.ct`) or the timeout expires,
+  the call's future is dropped and `notifications/cancelled` is sent upstream.
+- **Progress**: the rmcp client imposes its own `progressToken` on every request (a counter
+  per connection). So we send the request, read the chosen token
+  (`RequestHandle::progress_token`), then register the "upstream token → downstream client"
+  route in the `ProgressRouter` **of that connection**. A notification that arrives before
+  the registration is kept and relayed afterwards. The downstream client receives its own
+  token.
+- **Multi-round-trip requests (MRTR)**: an upstream `InputRequiredResult` is returned as is
+  to the downstream client. When the client calls `call_tool` again with `inputResponses` /
+  `requestState`, these fields are forwarded upstream. The gateway keeps no state between
+  rounds.
 
-## Rafraîchissement et santé des amonts
+## Upstream refresh and health
 
 ```text
-démarrage ──▶ initial_load : tous les amonts en parallèle ──▶ ready = true
+startup ──▶ initial_load: all upstreams in parallel ──▶ ready = true
                                                                 │
-              une tâche par amont, toutes les probe_interval_seconds
+              one task per upstream, every probe_interval_seconds
                                                                 ▼
-              cache plus vieux que cache_ttl ? ──oui──▶ tools/list complet
-                     │                                   └─ liste changée ? ──▶ rebuild_catalog
-                     non
-                     └──▶ sonde légère (première page de tools/list)
-              puis : record_probe → santé, métrique mcportal_upstream_up
+              cache older than cache_ttl? ──yes──▶ full tools/list
+                     │                              └─ list changed? ──▶ rebuild_catalog
+                     no
+                     └──▶ lightweight probe (first page of tools/list)
+              then: record_probe → health, mcportal_upstream_up metric
 ```
 
-Un amont devient `unavailable` après `failure_threshold` échecs consécutifs. Ses derniers
-outils connus restent dans le catalogue ; un appel est tout de même tenté, ce qui permet de
-retrouver l'amont sans attendre la sonde suivante.
+An upstream becomes `unavailable` after `failure_threshold` consecutive failures. Its last
+known tools stay in the catalog; a call is still attempted, which allows the upstream to be
+recovered without waiting for the next probe.
 
-## Concurrence et threads
+## Concurrency and threads
 
-Runtime `tokio` multi-thread ; chaque requête HTTP est une tâche. Règles suivies :
+Multi-threaded `tokio` runtime; each HTTP request is a task. Rules followed:
 
-- aucun appel bloquant sur le chemin des requêtes (le guide est lu avec `tokio::fs`) ;
-- `std::sync::Mutex` seulement pour des sections critiques très courtes, sans `await` ;
-- `tokio::sync::Mutex` pour la connexion amont, tenue pendant la connexion afin que deux
-  requêtes simultanées n'ouvrent qu'une seule connexion ;
-- `ArcSwap` pour la donnée lue partout et écrite rarement (le catalogue).
+- no blocking call on the request path (the guide is read with `tokio::fs`);
+- `std::sync::Mutex` only for very short critical sections, without `await`;
+- `tokio::sync::Mutex` for the upstream connection, held while connecting so that two
+  simultaneous requests open only one connection;
+- `ArcSwap` for data read everywhere and written rarely (the catalog).
 
-## Démarrage et arrêt
+## Startup and shutdown
 
 ```text
-démarrage : Config::load ─▶ logs ─▶ Prometheus ─▶ écoute des ports ─▶ /health = 200
-            ─▶ initial_load (en tâche de fond) ─▶ /ready = 200
+startup : Config::load ─▶ logs ─▶ Prometheus ─▶ listen on ports ─▶ /health = 200
+          ─▶ initial_load (in the background) ─▶ /ready = 200
 
-SIGTERM   : /ready = 503 ─▶ axum n'accepte plus de connexions et attend les requêtes en cours
-            ─▶ annulation des tâches de fond ─▶ sortie
+SIGTERM : /ready = 503 ─▶ axum stops accepting connections and waits for in-flight requests
+          ─▶ background tasks cancelled ─▶ exit
 ```
 
-`/health` ne dépend pas des amonts : un amont en panne ne doit pas faire redémarrer la
-passerelle. `/ready` attend le premier chargement des outils, pour qu'un nouveau pod ne reçoive
-pas de trafic avec un catalogue vide pendant un rolling update.
+`/health` does not depend on the upstreams: a failing upstream must not cause the gateway
+to restart. `/ready` waits for the first tool load, so that a new pod does not receive
+traffic with an empty catalog during a rolling update.
 
-## Observabilité
+## Observability
 
-| Métrique | Type | Labels |
+| Metric | Type | Labels |
 | --- | --- | --- |
 | `mcportal_tool_calls_total` | counter | server, tool, status |
 | `mcportal_tool_call_duration_seconds` | histogram | server |
@@ -260,134 +260,133 @@ pas de trafic avec un catalogue vide pendant un rolling update.
 | `mcportal_catalog_tools` | gauge | — |
 | `mcportal_feedback_total` | counter | server |
 
-Valeurs de `status` : `ok`, `tool_error`, `upstream_error`, `timeout`, `rejected`, `invalid`,
-`cancelled`. Aucune métrique ne porte d'identifiant d'utilisateur, pour éviter l'explosion de
-cardinalité.
+`status` values: `ok`, `tool_error`, `upstream_error`, `timeout`, `rejected`, `invalid`,
+`cancelled`. No metric carries a user identifier, to avoid a cardinality explosion.
 
-Chaque appel relayé produit un log `"message": "appel d'outil"` avec `server`, `tool`,
-`status`, `duration_ms` et `upstream_ms`. Les retours de `send_feedback` portent
+Each relayed call produces a `"message": "tool call"` log with `server`, `tool`, `status`,
+`duration_ms` and `upstream_ms`. Feedback from `send_feedback` carries
 `"label": "FEEDBACK"`.
 
-## Stratégie de test
+## Testing strategy
 
-| Niveau | Où | Ce qui est vérifié |
+| Level | Where | What is checked |
 | --- | --- | --- |
-| Unitaire | `#[cfg(test)]` dans chaque module | config, BM25, sémaphores, extraction des citations du guide |
-| Intégration | `tests/gateway.rs` | de bout en bout avec de vrais serveurs MCP simulés : recherche, appels, erreurs, timeout, saturation, catalogue, guide, progression, clients anciens, arrêt propre |
-| Dérive du guide | `tests/guide_drift.rs` (ignoré par défaut) | serveurs cités activés dans le registre ; outils cités présents chez les vrais amonts |
-| Performance | `benches/overhead.rs` | appel direct vs via la passerelle |
+| Unit | `#[cfg(test)]` in each module | config, BM25, semaphores, extraction of guide citations |
+| Integration | `tests/gateway.rs` | end to end with real mock MCP servers: search, calls, errors, timeout, saturation, catalog, guide, progress, older clients, graceful shutdown |
+| Guide drift | `tests/guide_drift.rs` (ignored by default) | cited servers enabled in the registry; cited tools present on the real upstreams |
+| Performance | `benches/overhead.rs` | direct call vs through the gateway |
 
-## Décisions de conception
+## Design decisions
 
-Cette section garde la trace du **pourquoi** des choix structurants, pour qu'on puisse les
-remettre en cause en connaissance de cause.
+This section records the **why** behind the structural choices, so that they can be
+challenged with full knowledge of the trade-offs.
 
-### Protocole MCP 2026-07-28 et mode stateless
+### MCP protocol 2026-07-28 and stateless mode
 
-La révision 2026-07-28 de la spec MCP supprime les sessions (`Mcp-Session-Id`) et la poignée
-de main `initialize` : chaque requête porte sa version de protocole, les capacités et
-l'identité du client dans `_meta`.
+The 2026-07-28 revision of the MCP spec removes sessions (`Mcp-Session-Id`) and the
+`initialize` handshake: each request carries its protocol version, the client's
+capabilities and identity in `_meta`.
 
-- **Côté aval**, la passerelle sert toutes les requêtes sans session, y compris pour les
-  clients plus anciens (`legacy_session_mode(false)`). Conséquence : n'importe quel pod peut
-  servir n'importe quelle requête. Plusieurs réplicas fonctionnent sans sessions sticky, et un
-  redémarrage de pod ne coupe aucun client.
-- **Côté amont**, un client rmcp partagé par serveur. Les amonts encore en version 2025-xx
-  gardent leurs sessions, gérées par rmcp (réouverture automatique d'une session expirée).
-- `tools/list` renvoie `ttlMs` et `cacheScope: public` : la liste est la même pour tous les
-  clients.
+- **Downstream**, the gateway serves every request without a session, including for older
+  clients (`legacy_session_mode(false)`). Consequence: any pod can serve any request.
+  Several replicas work without sticky sessions, and a pod restart disconnects no client.
+- **Upstream**, one rmcp client shared per server. Upstreams still on a 2025-xx version keep
+  their sessions, managed by rmcp (an expired session is reopened automatically).
+- `tools/list` returns `ttlMs` and `cacheScope: public`: the list is the same for every
+  client.
 
-### Pas de rechargement à chaud de la configuration
+### No configuration hot reload
 
-L'objectif était d'éviter les coupures lors d'un changement de config sur Kubernetes. Avec un
-protocole sans session, un **rolling update** suffit et ne coupe personne :
+The goal was to avoid outages when the config changes on Kubernetes. With a sessionless
+protocol, a **rolling update** is enough and disconnects no one:
 
-1. le ConfigMap change ; une annotation `checksum/config` (Helm) ou l'outil Reloader
-   déclenche le rolling update ;
-2. le nouveau pod démarre et ne se déclare prêt qu'après le premier chargement des outils ;
-3. l'ancien pod reçoit SIGTERM, se déclare non prêt et termine ses appels en cours.
+1. the ConfigMap changes; a `checksum/config` annotation (Helm) or the Reloader tool
+   triggers the rolling update;
+2. the new pod starts and only reports ready after the first tool load;
+3. the old pod receives SIGTERM, reports not ready and finishes its in-flight calls.
 
-Ce qui rend cela possible, c'est l'arrêt propre décrit plus haut, avec côté Kubernetes un
-`preStop` de quelques secondes et un `terminationGracePeriodSeconds` supérieur au plus grand
-`timeout` amont.
+What makes this possible is the graceful shutdown described above, together with a
+`preStop` of a few seconds on the Kubernetes side and a `terminationGracePeriodSeconds`
+greater than the largest upstream `timeout`.
 
-Le coût d'un rechargement à chaud aurait été modéré (environ 200 lignes), mais avec des
-pièges : sémaphores redimensionnés pendant que des places sont prises, paramètres non
-rechargeables (port d'écoute), détection fiable des mises à jour de ConfigMap (remplacement
-atomique d'un lien symbolique). Si le besoin revient, l'`ArcSwap` du catalogue fournit déjà le
-mécanisme d'échange : il resterait à surveiller le fichier et à comparer les amonts.
+The cost of a hot reload would have been moderate (about 200 lines), but with pitfalls:
+semaphores resized while permits are held, non-reloadable settings (listening port),
+reliable detection of ConfigMap updates (atomic replacement of a symbolic link). If the
+need comes back, the catalog's `ArcSwap` already provides the swap mechanism: what would
+remain is watching the file and diffing the upstreams.
 
-### Concurrence et limites : globales en V1
+### Concurrency and limits: global in V1
 
-Deux limites, globale et par serveur, protègent les amonts sans avoir besoin de savoir qui
-appelle. Il n'y a ni authentification ni limite par utilisateur en V1.
+Two limits, global and per server, protect the upstreams without needing to know who is
+calling. There is no authentication and no per-user limit in V1.
 
-Points à retenir pour la suite :
+Points to keep in mind for later:
 
-- **Le client MCP n'identifie pas l'utilisateur** : `clientInfo` décrit le logiciel (et il est
-  déclaratif), `Mcp-Session-Id` n'existe plus. Le seul mécanisme prévu par la spec est
-  `Authorization: Bearer` (OAuth 2.1), la passerelle jouant le rôle de *resource server*.
-- **Une limite par adresse IP ne marche pas avec Claude.ai** : les connecteurs appellent depuis
-  les serveurs d'Anthropic, donc tous leurs utilisateurs partageraient quelques adresses.
-- Options envisagées, de la plus simple à la plus complète :
+- **The MCP client does not identify the user**: `clientInfo` describes the software (and
+  is self-declared), `Mcp-Session-Id` no longer exists. The only mechanism provided by the
+  spec is `Authorization: Bearer` (OAuth 2.1), with the gateway acting as the *resource
+  server*.
+- **A per-IP-address limit does not work with Claude.ai**: connectors call from
+  Anthropic's servers, so all their users would share a few addresses.
+- Options considered, from simplest to most complete:
 
-  | Mode | Identité | Remarque |
+  | Mode | Identity | Note |
   | --- | --- | --- |
-  | `api_key` | clé personnelle en `Authorization: Bearer` | simple, sans fournisseur d'identité ; clés dans un Secret Kubernetes |
-  | `oauth` | jeton d'un fournisseur d'identité (Keycloak, éventuellement fédéré avec GitHub ou Google) | le plus propre ; l'utilisateur se connecte dans son navigateur. Limite : il faut un compte sur ce fournisseur |
+  | `api_key` | personal key in `Authorization: Bearer` | simple, no identity provider; keys in a Kubernetes Secret |
+  | `oauth` | token from an identity provider (Keycloak, possibly federated with GitHub or Google) | the cleanest; the user signs in through their browser. Limitation: an account on that provider is required |
 
-- **Ne jamais retransmettre le jeton d'un utilisateur aux amonts** (interdit par la spec,
-  risque de « confused deputy ») : si un amont exige une authentification, la passerelle
-  utilise ses propres identifiants.
+- **Never forward a user's token to the upstreams** (forbidden by the spec, "confused
+  deputy" risk): if an upstream requires authentication, the gateway uses its own
+  credentials.
 
-### Recherche avec le crate `bm25`
+### Search with the `bm25` crate
 
-Il y a au plus quelques centaines d'outils : l'index se reconstruit en quelques millisecondes
-et tient en mémoire. Un moteur complet (tantivy) ou une base embarquée (DuckDB et son
-extension plein texte) seraient surdimensionnés. Le module est isolé derrière le trait
-`ToolIndex` en vue d'une contribution au SDK rmcp (module optionnel ou crate séparé, à
-discuter d'abord avec ses mainteneurs).
+There are at most a few hundred tools: the index is rebuilt in a few milliseconds and fits
+in memory. A full engine (tantivy) or an embedded database (DuckDB and its full-text
+extension) would be oversized. The module is isolated behind the `ToolIndex` trait with a
+view to contributing it to the rmcp SDK (optional module or separate crate, to be
+discussed with its maintainers first).
 
-### Catalogue en ressources plutôt qu'en outils
+### Catalog as resources rather than tools
 
-Une ressource ne coûte rien au contexte du client tant qu'il ne la lit pas, et elle reste
-lisible quand la recherche d'outils masque `tools/list`. Le catalogue est toujours généré
-depuis le registre et l'état des amonts ; le guide de déploiement contient du récit et des
-renvois, jamais d'inventaire.
+A resource costs nothing in the client's context until it reads it, and it stays readable
+when tool search hides `tools/list`. The catalog is always generated from the registry and
+the upstreams' state; the deployment guide contains narrative and pointers, never an
+inventory.
 
-### Métriques Prometheus en plus des logs
+### Prometheus metrics on top of logs
 
-Les logs JSON vont dans Loki, mais calculer des latences et des taux d'erreur à partir des
-logs est coûteux et imprécis. Les métriques Prometheus, servies sur un port séparé non exposé
-publiquement, alimentent les tableaux de bord Grafana à faible coût.
+JSON logs go to Loki, but computing latencies and error rates from logs is costly and
+imprecise. Prometheus metrics, served on a separate port that is not publicly exposed, feed
+the Grafana dashboards cheaply.
 
-### Transport amont `sse` non supporté
+### Upstream `sse` transport not supported
 
-L'ancien transport HTTP+SSE est déprécié par la spec et n'existe plus dans le client
-rmcp 3.x. La valeur reste acceptée dans le registre pour ne pas casser une config existante,
-mais le serveur est signalé `unavailable` avec un message explicite.
+The old HTTP+SSE transport is deprecated by the spec and no longer exists in the rmcp 3.x
+client. The value is still accepted in the registry so as not to break an existing config,
+but the server is reported `unavailable` with an explicit message.
 
-### Mesure de l'overhead
+### Overhead measurement
 
-Mesuré en local avec `cargo bench --bench overhead` :
+Measured locally with `cargo bench --bench overhead`:
 
-| Chemin | Temps médian |
+| Path | Median time |
 | --- | --- |
-| client → amont | ~0,95 ms |
-| client → passerelle → amont | ~1,8 ms |
-| `search_tools` (sans amont) | ~0,87 ms |
+| client → upstream | ~0.95 ms |
+| client → gateway → upstream | ~1.8 ms |
+| `search_tools` (no upstream) | ~0.87 ms |
 
-L'overhead (~0,9 ms) vient essentiellement du saut HTTP supplémentaire ; le traitement propre
-à la passerelle (résolution, validation, sémaphores) est négligeable. Les réponses en JSON
-simple plutôt qu'en flux SSE (`json_response`) l'ont réduit d'environ 20 %.
+The overhead (~0.9 ms) mostly comes from the extra HTTP hop; the gateway's own processing
+(resolution, validation, semaphores) is negligible. Plain JSON responses rather than an SSE
+stream (`json_response`) reduced it by about 20%.
 
-### Récapitulatif des choix écartés
+### Summary of rejected options
 
-| Option | Pourquoi pas (pour l'instant) |
+| Option | Why not (for now) |
 | --- | --- |
-| Rechargement à chaud de la config | inutile sans session : un rolling update ne coupe personne |
-| Sessions MCP | supprimées par la spec 2026-07-28 ; elles imposeraient des sessions sticky |
-| tantivy / DuckDB pour la recherche | surdimensionnés pour quelques centaines d'outils |
-| Authentification, limites par utilisateur | reportées après la V1 (voir plus haut) |
-| Limite par adresse IP | inopérante avec les connecteurs Claude.ai |
-| Transport amont `sse` | déprécié par la spec et absent du client rmcp 3.x |
+| Configuration hot reload | pointless without sessions: a rolling update disconnects no one |
+| MCP sessions | removed by the 2026-07-28 spec; they would require sticky sessions |
+| tantivy / DuckDB for search | oversized for a few hundred tools |
+| Authentication, per-user limits | postponed until after V1 (see above) |
+| Per-IP-address limit | ineffective with Claude.ai connectors |
+| Upstream `sse` transport | deprecated by the spec and absent from the rmcp 3.x client |

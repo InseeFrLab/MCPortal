@@ -1,9 +1,9 @@
-//! Outils partagés par les tests d'intégration et le benchmark :
+//! Helpers shared by the integration tests and the benchmark:
 //!
-//! - [`MockUpstream`] : un vrai serveur MCP (rmcp) avec quelques outils de test ;
-//! - [`spawn_upstream`] / [`spawn_gateway`] : démarrent amont et passerelle sur des ports
-//!   aléatoires de 127.0.0.1 ;
-//! - [`connect`] : un client MCP (rmcp) connecté à une URL.
+//! - [`MockUpstream`]: a real MCP server (rmcp) with a few test tools;
+//! - [`spawn_upstream`] / [`spawn_gateway`]: start an upstream and a gateway on random
+//!   127.0.0.1 ports;
+//! - [`connect`]: an MCP client (rmcp) connected to a URL.
 #![allow(dead_code)]
 
 use std::{sync::Arc, time::Duration};
@@ -32,26 +32,26 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------------------------
-// Serveur amont simulé
+// Mock upstream server
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct EchoArgs {
-    /// Texte à renvoyer
+    /// Text to send back
     pub text: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AddArgs {
-    /// Premier entier
+    /// First integer
     pub a: i64,
-    /// Second entier
+    /// Second integer
     pub b: i64,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SlowArgs {
-    /// Durée d'attente en millisecondes
+    /// Wait duration in milliseconds
     pub ms: u64,
 }
 
@@ -68,22 +68,22 @@ impl MockUpstream {
         }
     }
 
-    #[tool(description = "Renvoie le texte reçu (écho)")]
+    #[tool(description = "Returns the received text (echo)")]
     fn echo(&self, Parameters(EchoArgs { text }): Parameters<EchoArgs>) -> String {
         text
     }
 
-    #[tool(description = "Additionne deux nombres entiers (addition)")]
+    #[tool(description = "Adds two integers (addition)")]
     fn add(&self, Parameters(AddArgs { a, b }): Parameters<AddArgs>) -> String {
         (a + b).to_string()
     }
 
-    #[tool(description = "Échoue toujours : renvoie une erreur d'outil")]
+    #[tool(description = "Always fails: returns a tool error")]
     fn fail(&self) -> CallToolResult {
-        CallToolResult::error(vec![ContentBlock::text("échec volontaire")])
+        CallToolResult::error(vec![ContentBlock::text("intentional failure")])
     }
 
-    #[tool(description = "Envoie trois notifications de progression puis répond")]
+    #[tool(description = "Sends three progress notifications then responds")]
     async fn progress(
         &self,
         meta: rmcp::model::RequestMetaObject,
@@ -99,13 +99,13 @@ impl MockUpstream {
                     .await;
             }
         }
-        "terminé".into()
+        "done".into()
     }
 
-    #[tool(description = "Attend un certain temps avant de répondre (lenteur)")]
+    #[tool(description = "Waits for a while before responding (slow)")]
     async fn slow(&self, Parameters(SlowArgs { ms }): Parameters<SlowArgs>) -> String {
         tokio::time::sleep(Duration::from_millis(ms)).await;
-        "fini".into()
+        "finished".into()
     }
 }
 
@@ -116,7 +116,7 @@ impl ServerHandler for MockUpstream {
     }
 }
 
-/// Démarre un amont simulé. Renvoie son URL MCP ; il s'arrête quand le jeton est annulé.
+/// Starts a mock upstream. Returns its MCP URL; it stops when the token is cancelled.
 pub async fn spawn_upstream(ct: &CancellationToken) -> String {
     let service = StreamableHttpService::new(
         || Ok(MockUpstream::new()),
@@ -139,20 +139,20 @@ pub async fn spawn_upstream(ct: &CancellationToken) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Passerelle
+// Gateway
 // ---------------------------------------------------------------------------------------------
 
 pub struct TestGateway {
-    /// URL MCP de la passerelle.
+    /// MCP URL of the gateway.
     pub url: String,
-    /// URL de base HTTP (pour /health, /ready).
+    /// HTTP base URL (for /health, /ready).
     pub base: String,
     pub state: Arc<AppState>,
     pub stop: CancellationToken,
     pub handle: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
-/// Démarre une passerelle avec cette config et attend qu'elle soit prête.
+/// Starts a gateway with this config and waits until it is ready.
 pub async fn spawn_gateway(config: Config) -> TestGateway {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -180,15 +180,15 @@ pub async fn spawn_gateway(config: Config) -> TestGateway {
     }
 }
 
-/// Config de test : un serveur « mock » (ou plus) pointant vers les URLs données.
-/// `extra_gateway` et `extra_server` sont insérés tels quels dans le YAML.
+/// Test config: one "mock" server (or more) pointing to the given URLs.
+/// `extra_gateway` and `extra_server` are inserted as is into the YAML.
 pub fn config(upstreams: &[(&str, &str)], extra_gateway: &str, extra_server: &str) -> Config {
     let mut yaml = format!(
         "gateway:\n  name: Test Gateway\n  health: {{probe_interval_seconds: 3600, failure_threshold: 1}}\n{extra_gateway}\nservers:\n"
     );
     for (name, url) in upstreams {
         yaml.push_str(&format!(
-            "  - name: {name}\n    url: {url}\n    domain: test\n    description: Serveur de test\n{extra_server}\n"
+            "  - name: {name}\n    url: {url}\n    domain: test\n    description: Test server\n{extra_server}\n"
         ));
     }
     Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e}\n{yaml}"))
@@ -200,7 +200,7 @@ pub fn config(upstreams: &[(&str, &str)], extra_gateway: &str, extra_server: &st
 
 pub type Client = RunningService<RoleClient, ()>;
 
-/// Client MCP 2026-07-28 (stateless).
+/// MCP 2026-07-28 client (stateless).
 pub async fn connect(url: &str) -> Client {
     connect_with(
         url,
@@ -219,19 +219,19 @@ pub async fn connect_with(url: &str, lifecycle: ClientLifecycleMode) -> Client {
         lifecycle,
     )
     .await
-    .expect("connexion MCP")
+    .expect("MCP connection")
 }
 
-/// Appelle un outil avec des arguments JSON.
+/// Calls a tool with JSON arguments.
 pub async fn call(client: &Client, name: &str, arguments: Value) -> CallToolResult {
     let arguments = arguments.as_object().cloned().unwrap_or_default();
     client
         .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
         .await
-        .expect("appel MCP")
+        .expect("MCP call")
 }
 
-/// Appelle `call_tool` de la passerelle.
+/// Calls the gateway's `call_tool`.
 pub async fn call_via_gateway(client: &Client, tool: &str, arguments: Value) -> CallToolResult {
     call(
         client,
@@ -241,7 +241,7 @@ pub async fn call_via_gateway(client: &Client, tool: &str, arguments: Value) -> 
     .await
 }
 
-/// Texte du premier bloc de contenu.
+/// Text of the first content block.
 pub fn text(result: &CallToolResult) -> String {
     result
         .content

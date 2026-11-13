@@ -1,37 +1,37 @@
-//! # Serveurs amont : connexion, appels, santé
+//! # Upstream servers: connection, calls, health
 //!
-//! Un [`Upstream`] représente **un** serveur MCP du registre. Il regroupe :
+//! An [`Upstream`] represents **one** MCP server from the registry. It groups:
 //!
-//! - sa configuration ([`UpstreamConfig`]) ;
-//! - un **client rmcp partagé** par tous les utilisateurs de la passerelle. En Streamable HTTP
-//!   chaque appel est un POST indépendant : un seul client suffit pour des appels concurrents ;
-//! - un **sémaphore** qui borne les appels simultanés (`max_concurrency`) ;
-//! - son **état de santé** et le **cache de sa liste d'outils**, mis à jour par la boucle de
-//!   rafraîchissement (voir [`crate::state`]).
+//! - its configuration ([`UpstreamConfig`]);
+//! - one **rmcp client shared** by all the gateway's users. With Streamable HTTP every call
+//!   is an independent POST: a single client is enough for concurrent calls;
+//! - a **semaphore** that bounds concurrent calls (`max_concurrency`);
+//! - its **health state** and the **cache of its tool list**, updated by the refresh loop
+//!   (see [`crate::state`]).
 //!
-//! ## Cycle de vie de la connexion
+//! ## Connection lifecycle
 //!
-//! La connexion est ouverte **paresseusement** (au premier besoin) et refaite si le transport
-//! se ferme. Un amont injoignable au démarrage ne bloque donc pas la passerelle : il sera
-//! simplement marqué « unavailable » et retenté à la sonde suivante.
+//! The connection is opened **lazily** (when first needed) and reopened if the transport
+//! closes. An upstream that is unreachable at startup therefore does not block the gateway:
+//! it is simply marked "unavailable" and retried at the next probe.
 //!
-//! On négocie la version de protocole en mode `Auto` : on tente d'abord `server/discover`
-//! (MCP 2026-07-28, sans session) et on retombe sur l'ancienne poignée de main `initialize`
-//! si l'amont est plus ancien. rmcp gère aussi le renouvellement d'une session expirée
-//! (`reinit_on_expired_session`) pour ces amonts anciens.
+//! The protocol version is negotiated in `Auto` mode: `server/discover` (MCP 2026-07-28,
+//! sessionless) is tried first, falling back to the old `initialize` handshake if the
+//! upstream is older. rmcp also handles renewing an expired session
+//! (`reinit_on_expired_session`) for these older upstreams.
 //!
-//! ## Relais des notifications de progression
+//! ## Relaying progress notifications
 //!
-//! Quand le client aval fournit un `progressToken`, il faut relayer les
-//! `notifications/progress` de l'amont vers lui. Deux subtilités :
+//! When the downstream client provides a `progressToken`, the upstream's
+//! `notifications/progress` must be relayed to it. Two subtleties:
 //!
-//! - le client rmcp **impose son propre jeton** à chaque requête amont (un compteur propre à
-//!   la connexion) : on ne le connaît qu'après l'envoi (`RequestHandle::progress_token`) ;
-//! - ce compteur repart de zéro à chaque connexion : la table de correspondance
-//!   ([`ProgressRouter`]) est donc **propre à chaque connexion** amont.
+//! - the rmcp client **imposes its own token** on every upstream request (a per-connection
+//!   counter): it is only known after sending (`RequestHandle::progress_token`);
+//! - this counter restarts from zero on each connection: the mapping table
+//!   ([`ProgressRouter`]) is therefore **specific to each** upstream connection.
 //!
-//! Le [`ProgressRouter`] associe « jeton amont → (client aval, jeton aval) » et restitue au
-//! client aval son jeton d'origine.
+//! The [`ProgressRouter`] maps "upstream token → (downstream client, downstream token)" and
+//! gives the downstream client back its original token.
 
 use std::{
     collections::HashMap,
@@ -59,37 +59,36 @@ use tokio::sync::Semaphore;
 
 use crate::config::{Transport, UpstreamConfig};
 
-/// Une connexion ouverte vers un amont : le client rmcp et la table de relais de progression
-/// propre à cette connexion.
+/// An open connection to an upstream: the rmcp client and the progress relay table specific
+/// to this connection.
 struct Connection {
     client: RunningService<RoleClient, UpstreamClientHandler>,
     progress: Arc<ProgressRouter>,
 }
 
 // ---------------------------------------------------------------------------------------------
-// Erreurs
+// Errors
 // ---------------------------------------------------------------------------------------------
 
-/// Ce qui peut mal se passer en parlant à un amont.
+/// What can go wrong when talking to an upstream.
 ///
-/// Toutes ces erreurs finissent en `CallToolResult { isError: true }` côté aval : ce sont des
-/// erreurs **exploitables par le LLM** (il peut réessayer, changer d'outil…), pas des
-/// requêtes mal formées.
+/// All these errors end up as `CallToolResult { isError: true }` downstream: they are errors
+/// **the LLM can act on** (retry, switch tools…), not malformed requests.
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
-    #[error("serveur amont '{server}' injoignable: {reason}")]
+    #[error("upstream server '{server}' unreachable: {reason}")]
     Unavailable { server: String, reason: String },
-    #[error("le serveur amont '{server}' n'a pas répondu en {timeout:?}")]
+    #[error("upstream server '{server}' did not respond within {timeout:?}")]
     Timeout { server: String, timeout: Duration },
-    #[error("le serveur amont '{server}' a renvoyé une erreur: {message}")]
+    #[error("upstream server '{server}' returned an error: {message}")]
     Protocol { server: String, message: String },
 }
 
 // ---------------------------------------------------------------------------------------------
-// Relais de progression
+// Progress relay
 // ---------------------------------------------------------------------------------------------
 
-/// Table « jeton amont → (client aval, jeton aval) » d'**une** connexion amont.
+/// "upstream token → (downstream client, downstream token)" table of **one** upstream connection.
 #[derive(Default)]
 pub struct ProgressRouter {
     inner: Mutex<RouterInner>,
@@ -98,18 +97,18 @@ pub struct ProgressRouter {
 #[derive(Default)]
 struct RouterInner {
     routes: HashMap<ProgressToken, (Peer<RoleServer>, ProgressToken)>,
-    /// Notifications reçues **avant** l'enregistrement de leur route : la requête part vers
-    /// l'amont avant qu'on connaisse son jeton, une notification très rapide peut donc
-    /// arriver en premier. On la garde de côté (taille bornée) au lieu de la perdre.
+    /// Notifications received **before** their route was registered: the request is sent
+    /// upstream before its token is known, so a very fast notification can arrive first. It
+    /// is kept aside (bounded size) instead of being lost.
     early: HashMap<ProgressToken, Vec<ProgressNotificationParam>>,
 }
 
-/// Au-delà, les notifications « orphelines » sont oubliées (jetons de requêtes sans relais).
+/// Beyond this, "orphan" notifications are dropped (tokens of requests without a relay).
 const MAX_EARLY_TOKENS: usize = 256;
 
 impl ProgressRouter {
-    /// Enregistre la route d'un appel. Elle est supprimée quand le [`ProgressRoute`] renvoyé
-    /// est détruit (fin de l'appel). Les notifications arrivées en avance sont relayées.
+    /// Registers the route of a call. It is removed when the returned [`ProgressRoute`] is
+    /// dropped (end of the call). Notifications that arrived early are relayed.
     pub fn register(
         self: &Arc<Self>,
         upstream_token: ProgressToken,
@@ -138,7 +137,7 @@ impl ProgressRouter {
         }
     }
 
-    /// Renvoie la notification au client aval concerné.
+    /// Forwards the notification to the relevant downstream client.
     async fn forward(&self, mut params: ProgressNotificationParam) {
         let route = {
             let mut inner = self.inner.lock().expect("progress lock");
@@ -160,13 +159,13 @@ impl ProgressRouter {
         if let Some((peer, downstream_token)) = route {
             params.progress_token = downstream_token;
             if let Err(e) = peer.notify_progress(params).await {
-                tracing::debug!(error = %e, "relais de progression impossible");
+                tracing::debug!(error = %e, "progress relay failed");
             }
         }
     }
 }
 
-/// Garde RAII : tant qu'elle vit, la route de progression existe.
+/// RAII guard: as long as it lives, the progress route exists.
 pub struct ProgressRoute {
     router: Arc<ProgressRouter>,
     token: ProgressToken,
@@ -181,8 +180,8 @@ impl Drop for ProgressRoute {
     }
 }
 
-/// Envoie `notifications/cancelled` à l'amont si l'appel est abandonné (client aval parti,
-/// timeout) avant d'avoir reçu sa réponse. `Drop` ne peut pas attendre : on lance une tâche.
+/// Sends `notifications/cancelled` to the upstream if the call is dropped (downstream client
+/// gone, timeout) before its response was received. `Drop` cannot await: a task is spawned.
 struct CancelOnDrop {
     peer: Peer<RoleClient>,
     id: Option<RequestId>,
@@ -193,7 +192,7 @@ impl Drop for CancelOnDrop {
         if let Some(id) = self.id.take() {
             let peer = self.peer.clone();
             tokio::spawn(async move {
-                let reason = Some("appel abandonné par la passerelle".to_owned());
+                let reason = Some("call abandoned by the gateway".to_owned());
                 let _ = peer
                     .notify_cancelled(CancelledNotificationParam::new(Some(id), reason))
                     .await;
@@ -202,9 +201,9 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// Handler côté **client** rmcp : décrit la passerelle auprès de l'amont et reçoit ses
-/// notifications. On n'implémente que `on_progress` ; tout le reste garde le comportement
-/// par défaut de rmcp.
+/// rmcp **client**-side handler: describes the gateway to the upstream and receives its
+/// notifications. Only `on_progress` is implemented; everything else keeps rmcp's default
+/// behavior.
 pub struct UpstreamClientHandler {
     progress: Arc<ProgressRouter>,
 }
@@ -227,34 +226,34 @@ impl ClientHandler for UpstreamClientHandler {
 }
 
 // ---------------------------------------------------------------------------------------------
-// État de santé
+// Health state
 // ---------------------------------------------------------------------------------------------
 
-/// État observable d'un amont (lu par le catalogue et `/health`).
+/// Observable state of an upstream (read by the catalog and `/health`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Availability {
-    /// Pas encore sondé.
+    /// Not probed yet.
     Unknown,
     Available,
-    /// `failure_threshold` échecs consécutifs (ou transport non supporté).
+    /// `failure_threshold` consecutive failures (or unsupported transport).
     Unavailable,
-    /// `enabled: false` dans le registre.
+    /// `enabled: false` in the registry.
     Disabled,
 }
 
-/// Instantané de la santé d'un amont.
+/// Snapshot of an upstream's health.
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthSnapshot {
     pub status: Availability,
     pub consecutive_failures: u32,
     pub last_error: Option<String>,
-    /// Horodatage UNIX (secondes) de la dernière sonde.
+    /// UNIX timestamp (seconds) of the last probe.
     pub last_probe_unix: Option<u64>,
     pub last_success_unix: Option<u64>,
-    /// Nombre d'outils dans le cache (None si jamais listés).
+    /// Number of tools in the cache (None if never listed).
     pub tool_count: Option<usize>,
-    /// Compteurs d'appels depuis le démarrage du pod.
+    /// Call counters since the pod started.
     pub calls_total: u64,
     pub calls_failed: u64,
 }
@@ -268,7 +267,7 @@ struct Health {
     ever_probed: bool,
 }
 
-/// Cache de la liste d'outils d'un amont.
+/// Cache of an upstream's tool list.
 #[derive(Debug, Clone)]
 struct ToolCache {
     tools: Arc<Vec<Tool>>,
@@ -279,16 +278,16 @@ struct ToolCache {
 // Upstream
 // ---------------------------------------------------------------------------------------------
 
-/// Un serveur MCP amont. Voir la documentation du module.
+/// An upstream MCP server. See the module documentation.
 pub struct Upstream {
     pub config: UpstreamConfig,
     failure_threshold: u32,
-    /// Limite `max_concurrency` de ce serveur.
+    /// `max_concurrency` limit of this server.
     pub semaphore: Semaphore,
-    /// Connexion courante. `tokio::sync::Mutex` car on la tient pendant l'`await` de connexion :
-    /// deux requêtes simultanées ne déclenchent ainsi qu'une seule connexion.
+    /// Current connection. `tokio::sync::Mutex` because it is held across the connection
+    /// `await`: two simultaneous requests thus trigger only one connection.
     connection: tokio::sync::Mutex<Option<Arc<Connection>>>,
-    /// `std::sync::Mutex` : sections critiques très courtes, jamais d'`await` dedans.
+    /// `std::sync::Mutex`: very short critical sections, never an `await` inside.
     health: Mutex<Health>,
     tools: Mutex<Option<ToolCache>>,
     calls_total: AtomicU64,
@@ -319,9 +318,9 @@ impl Upstream {
         &self.config.name
     }
 
-    // --- Connexion ------------------------------------------------------------------------
+    // --- Connection -----------------------------------------------------------------------
 
-    /// Renvoie la connexion courante, en (re)connectant si nécessaire.
+    /// Returns the current connection, (re)connecting if needed.
     async fn connection(&self) -> Result<Arc<Connection>, UpstreamError> {
         let mut guard = self.connection.lock().await;
         if let Some(connection) = guard.as_ref()
@@ -334,7 +333,7 @@ impl Upstream {
         Ok(connection)
     }
 
-    /// Oublie la connexion courante (elle sera refaite au prochain appel).
+    /// Forgets the current connection (it will be reopened on the next call).
     async fn invalidate(&self) {
         self.connection.lock().await.take();
     }
@@ -346,15 +345,15 @@ impl Upstream {
         };
         if self.config.transport == Transport::Sse {
             return Err(unavailable(
-                "transport 'sse' déprécié et non supporté par rmcp 3.x : utilisez 'http'".into(),
+                "'sse' transport is deprecated and not supported by rmcp 3.x: use 'http'".into(),
             ));
         }
 
         let mut transport_config =
             StreamableHttpClientTransportConfig::with_uri(self.config.url.as_str())
-                // Le transport ne doit pas être le goulot : notre sémaphore borne déjà les appels.
+                // The transport must not be the bottleneck: our semaphore already bounds the calls.
                 .max_concurrent_requests(self.config.max_concurrency.max(1) + 1);
-        // Amonts anciens (avec sessions) : rouvrir une session expirée automatiquement.
+        // Older upstreams (with sessions): reopen an expired session automatically.
         transport_config.reinit_on_expired_session = true;
         let transport = StreamableHttpClientTransport::from_config(transport_config);
 
@@ -369,20 +368,20 @@ impl Upstream {
         let connecting = handler.serve_with_lifecycle(transport, lifecycle);
         match tokio::time::timeout(self.config.timeout(), connecting).await {
             Ok(Ok(client)) => {
-                tracing::info!(server = %self.config.name, "connecté à l'amont");
+                tracing::info!(server = %self.config.name, "connected to upstream");
                 Ok(Connection { client, progress })
             }
             Ok(Err(e)) => Err(unavailable(e.to_string())),
             Err(_) => Err(unavailable(format!(
-                "pas de réponse à l'initialisation en {:?}",
+                "no response to initialization within {:?}",
                 self.config.timeout()
             ))),
         }
     }
 
-    // --- Opérations MCP -------------------------------------------------------------------
+    // --- MCP operations -------------------------------------------------------------------
 
-    /// Liste **tous** les outils de l'amont (toutes les pages), avec timeout.
+    /// Lists **all** the upstream's tools (every page), with a timeout.
     pub async fn fetch_tools(&self) -> Result<Vec<Tool>, UpstreamError> {
         let connection = self.connection().await?;
         let result =
@@ -390,10 +389,10 @@ impl Upstream {
         self.map_result(result).await
     }
 
-    /// Sonde légère : la première page de `tools/list`.
+    /// Lightweight probe: the first page of `tools/list`.
     ///
-    /// `ping` n'existe plus dans MCP 2026-07-28 et `server/discover` n'existe pas dans les
-    /// versions antérieures : `tools/list` est la seule requête que tous nos amonts servent.
+    /// `ping` no longer exists in MCP 2026-07-28 and `server/discover` does not exist in
+    /// earlier versions: `tools/list` is the only request all our upstreams serve.
     pub async fn probe(&self) -> Result<(), UpstreamError> {
         let connection = self.connection().await?;
         let result =
@@ -401,11 +400,12 @@ impl Upstream {
         self.map_result(result).await.map(|_| ())
     }
 
-    /// Appelle un outil amont **sans** gérer les tours MRTR : si l'amont renvoie un
-    /// `InputRequiredResult`, on le renvoie tel quel au client aval, qui fournira les réponses
-    /// en rappelant `call_tool` (avec `inputResponses` / `requestState`), que l'on retransmet.
+    /// Calls an upstream tool **without** handling MRTR rounds: if the upstream returns an
+    /// `InputRequiredResult`, it is returned as is to the downstream client, which will
+    /// provide the answers by calling `call_tool` again (with `inputResponses` /
+    /// `requestState`), which we forward.
     ///
-    /// La limite de concurrence n'est **pas** gérée ici mais dans [`crate::limits`].
+    /// The concurrency limit is **not** handled here but in [`crate::limits`].
     pub async fn call_tool(
         &self,
         params: CallToolRequestParams,
@@ -419,7 +419,7 @@ impl Upstream {
 
         let call = async {
             match progress {
-                // Cas courant : `call_tool_once` gère lui-même l'annulation si on l'abandonne.
+                // Common case: `call_tool_once` handles cancellation itself if dropped.
                 None => connection.client.call_tool_once(params).await,
                 Some(downstream) => Self::call_with_progress(&connection, params, downstream).await,
             }
@@ -430,8 +430,8 @@ impl Upstream {
             .inspect_err(|_| self.count_failure())
     }
 
-    /// Variante de `call_tool_once` qui relaie la progression : on envoie la requête à la main
-    /// pour connaître le jeton choisi par rmcp, puis on enregistre la route avant d'attendre.
+    /// Variant of `call_tool_once` that relays progress: the request is sent by hand to learn
+    /// the token chosen by rmcp, then the route is registered before waiting.
     async fn call_with_progress(
         connection: &Connection,
         params: CallToolRequestParams,
@@ -442,7 +442,7 @@ impl Upstream {
             .client
             .send_request_with_option(request, PeerRequestOptions::no_options())
             .await?;
-        // Les deux gardes vivent jusqu'à la fin de la fonction (ou son abandon).
+        // Both guards live until the end of the function (or until it is dropped).
         let _route = connection.progress.register(
             handle.progress_token.clone(),
             downstream,
@@ -453,7 +453,7 @@ impl Upstream {
             id: Some(handle.id.clone()),
         };
         let result = handle.await_response().await;
-        cancel.id = None; // réponse reçue : rien à annuler
+        cancel.id = None; // response received: nothing to cancel
         match result? {
             ServerResult::CallToolResult(r) => Ok(CallToolResponse::Complete(r)),
             ServerResult::InputRequiredResult(r) => Ok(CallToolResponse::InputRequired(r)),
@@ -466,8 +466,8 @@ impl Upstream {
         self.calls_failed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Convertit (timeout | erreur rmcp | succès) en `Result<T, UpstreamError>`, et invalide la
-    /// connexion si l'erreur vient du transport.
+    /// Converts (timeout | rmcp error | success) into `Result<T, UpstreamError>`, and
+    /// invalidates the connection if the error comes from the transport.
     async fn map_result<T>(
         &self,
         result: Result<Result<T, ServiceError>, tokio::time::error::Elapsed>,
@@ -479,12 +479,12 @@ impl Upstream {
                 server,
                 timeout: self.config.timeout(),
             }),
-            // Erreur JSON-RPC renvoyée par l'amont : la connexion est saine.
+            // JSON-RPC error returned by the upstream: the connection is healthy.
             Ok(Err(ServiceError::McpError(e))) => Err(UpstreamError::Protocol {
                 server,
                 message: e.message.to_string(),
             }),
-            // Toute autre erreur (transport fermé, réponse inattendue…) : on reconnectera.
+            // Any other error (transport closed, unexpected response…): reconnect later.
             Ok(Err(e)) => {
                 self.invalidate().await;
                 Err(UpstreamError::Unavailable {
@@ -495,9 +495,9 @@ impl Upstream {
         }
     }
 
-    // --- Cache d'outils et santé ----------------------------------------------------------
+    // --- Tool cache and health ------------------------------------------------------------
 
-    /// Outils en cache (dernière liste connue, même si l'amont est tombé depuis).
+    /// Cached tools (last known list, even if the upstream has gone down since).
     pub fn cached_tools(&self) -> Option<Arc<Vec<Tool>>> {
         self.tools
             .lock()
@@ -506,7 +506,7 @@ impl Upstream {
             .map(|c| c.tools.clone())
     }
 
-    /// Le cache a-t-il dépassé `cache_ttl` (ou est-il vide) ?
+    /// Is the cache older than `cache_ttl` (or empty)?
     pub fn cache_expired(&self) -> bool {
         match self.tools.lock().expect("tools lock").as_ref() {
             None => true,
@@ -514,7 +514,7 @@ impl Upstream {
         }
     }
 
-    /// Remplace le cache. Renvoie `true` si la liste a changé (→ reconstruire l'index).
+    /// Replaces the cache. Returns `true` if the list changed (→ rebuild the index).
     pub fn store_tools(&self, tools: Vec<Tool>) -> bool {
         let mut cache = self.tools.lock().expect("tools lock");
         let changed = cache.as_ref().map(|c| *c.tools != tools).unwrap_or(true);
@@ -525,7 +525,7 @@ impl Upstream {
         changed
     }
 
-    /// Enregistre le résultat d'une sonde.
+    /// Records the outcome of a probe.
     pub fn record_probe(&self, outcome: &Result<(), UpstreamError>) {
         let mut h = self.health.lock().expect("health lock");
         let now = SystemTime::now();
@@ -544,7 +544,7 @@ impl Upstream {
         }
     }
 
-    /// L'amont est-il considéré comme disponible ?
+    /// Is the upstream considered available?
     pub fn availability(&self) -> Availability {
         if !self.config.enabled {
             return Availability::Disabled;
@@ -559,7 +559,7 @@ impl Upstream {
         }
     }
 
-    /// Photographie de la santé, pour le catalogue et `/health`.
+    /// Health snapshot, for the catalog and `/health`.
     pub fn health_snapshot(&self) -> HealthSnapshot {
         let status = self.availability();
         let h = self.health.lock().expect("health lock");

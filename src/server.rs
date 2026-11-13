@@ -1,35 +1,35 @@
-//! # Assemblage HTTP : MCP, santé, métriques, arrêt propre
+//! # HTTP wiring: MCP, health, metrics, graceful shutdown
 //!
-//! Deux ports :
+//! Two ports:
 //!
-//! | Port | Routes | Exposé |
+//! | Port | Routes | Exposed |
 //! | --- | --- | --- |
-//! | `gateway.http.bind` (8000) | `/mcp` (MCP Streamable HTTP), `/health`, `/ready` | via l'ingress |
-//! | `metrics.prometheus.port` (9090) | `/metrics` | interne au cluster |
+//! | `gateway.http.bind` (8000) | `/mcp` (MCP Streamable HTTP), `/health`, `/ready` | through the ingress |
+//! | `metrics.prometheus.port` (9090) | `/metrics` | cluster-internal |
 //!
-//! ## Mode stateless
+//! ## Stateless mode
 //!
-//! On désactive le mode « session » de rmcp (`legacy_session_mode = false`) : chaque requête
-//! HTTP est autonome, quelle que soit la version du protocole du client. N'importe quel pod
-//! peut donc servir n'importe quelle requête : plusieurs réplicas, pas de sessions sticky.
+//! rmcp's "session" mode is disabled (`legacy_session_mode = false`): every HTTP request is
+//! self-contained, whatever the client's protocol version. Any pod can therefore serve any
+//! request: several replicas, no sticky sessions.
 //!
-//! ## Sondes Kubernetes
+//! ## Kubernetes probes
 //!
-//! - `/health` (liveness) : 200 tant que le process répond. Le corps JSON détaille l'état des
-//!   amonts, mais un amont en panne **ne fait pas** échouer la sonde (sinon Kubernetes
-//!   redémarrerait la passerelle pour une panne qui n'est pas la sienne).
-//! - `/ready` (readiness) : 200 quand le premier chargement des outils est fait, 503 avant et
-//!   pendant l'arrêt.
+//! - `/health` (liveness): 200 as long as the process responds. The JSON body details the
+//!   upstreams' status, but a failing upstream **does not** fail the probe (otherwise
+//!   Kubernetes would restart the gateway for an outage that is not its own).
+//! - `/ready` (readiness): 200 once the first tool load is done, 503 before that and during
+//!   shutdown.
 //!
-//! ## Arrêt propre (rolling update sans coupure)
+//! ## Graceful shutdown (rolling update without outage)
 //!
 //! ```text
-//! SIGTERM ─▶ /ready = 503 ─▶ axum n'accepte plus de connexions et attend la fin des requêtes
-//!         ─▶ annulation des tâches de fond ─▶ sortie
+//! SIGTERM ─▶ /ready = 503 ─▶ axum stops accepting connections and waits for in-flight requests
+//!         ─▶ background tasks cancelled ─▶ exit
 //! ```
 //!
-//! Côté Kubernetes : un `preStop: sleep 5` laisse le temps à l'ingress de retirer le pod, et
-//! `terminationGracePeriodSeconds` doit dépasser le plus grand `timeout` amont.
+//! On the Kubernetes side: a `preStop: sleep 5` gives the ingress time to remove the pod, and
+//! `terminationGracePeriodSeconds` must exceed the largest upstream `timeout`.
 
 use std::{net::SocketAddr, sync::Arc, sync::atomic::Ordering};
 
@@ -44,17 +44,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{gateway::Gateway, state::AppState};
 
-/// Construit le routeur du port principal (MCP + santé).
+/// Builds the router of the main port (MCP + health).
 ///
-/// `shutdown` est le jeton d'arrêt des flux MCP en cours ; il ne doit être annulé qu'**après**
-/// la fin du drain HTTP (voir [`serve`]).
+/// `shutdown` is the token that stops in-flight MCP streams; it must only be cancelled
+/// **after** the HTTP drain has finished (see [`serve`]).
 pub fn router(state: Arc<AppState>, shutdown: CancellationToken) -> Router {
     let http = &state.config.gateway.http;
     let mut mcp_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
-        // Réponse en `application/json` simple quand l'outil n'émet aucune notification
-        // (cas le plus courant) : moins coûteux qu'un flux SSE. rmcp repasse automatiquement en
-        // SSE si une notification (ex. progression) doit précéder la réponse.
+        // Plain `application/json` response when the tool emits no notification (the most
+        // common case): cheaper than an SSE stream. rmcp switches back to SSE automatically
+        // if a notification (e.g. progress) must precede the response.
         .with_json_response(true)
         .with_cancellation_token(shutdown);
     mcp_config = if http.allowed_hosts.is_empty() {
@@ -63,7 +63,7 @@ pub fn router(state: Arc<AppState>, shutdown: CancellationToken) -> Router {
         mcp_config.with_allowed_hosts(http.allowed_hosts.clone())
     };
 
-    // rmcp appelle cette fabrique pour chaque requête : on clone un `Arc`, c'est gratuit.
+    // rmcp calls this factory for every request: we clone an `Arc`, which is free.
     let factory_state = state.clone();
     let mcp = StreamableHttpService::new(
         move || Ok(Gateway::new(factory_state.clone())),
@@ -78,7 +78,7 @@ pub fn router(state: Arc<AppState>, shutdown: CancellationToken) -> Router {
         .with_state(state)
 }
 
-/// `/health` : liveness + état détaillé.
+/// `/health`: liveness + detailed status.
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let servers: serde_json::Map<String, serde_json::Value> = state
         .upstreams
@@ -98,7 +98,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }))
 }
 
-/// `/ready` : readiness.
+/// `/ready`: readiness.
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.is_ready() {
         (StatusCode::OK, "ready")
@@ -107,26 +107,25 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-/// Routeur du port métriques.
+/// Router of the metrics port.
 pub fn metrics_router(handle: PrometheusHandle) -> Router {
     Router::new().route("/metrics", get(move || std::future::ready(handle.render())))
 }
 
-/// Sert la passerelle jusqu'à ce que `stop` soit annulé, puis s'arrête proprement.
+/// Serves the gateway until `stop` is cancelled, then shuts down gracefully.
 ///
-/// Les écouteurs sont passés déjà ouverts : les tests peuvent ainsi utiliser un port
-/// aléatoire (`127.0.0.1:0`).
+/// Listeners are passed already bound, so tests can use a random port (`127.0.0.1:0`).
 pub async fn serve(
     state: Arc<AppState>,
     listener: TcpListener,
     metrics: Option<(PrometheusHandle, TcpListener)>,
     stop: CancellationToken,
 ) -> anyhow::Result<()> {
-    // Jeton « interne » : annulé seulement après le drain, pour arrêter les tâches de fond et
-    // les flux MCP restants.
+    // "Internal" token: cancelled only after the drain, to stop the background tasks and the
+    // remaining MCP streams.
     let background = CancellationToken::new();
 
-    // Tâches de fond : premier chargement des outils, puis rafraîchissement périodique.
+    // Background tasks: initial tool load, then periodic refresh.
     {
         let state = state.clone();
         let background = background.clone();
@@ -136,14 +135,14 @@ pub async fn serve(
         });
     }
 
-    // Port métriques (s'arrête avec le jeton interne).
+    // Metrics port (stops with the internal token).
     if let Some((handle, metrics_listener)) = metrics {
         let background = background.clone();
         tokio::spawn(async move {
             let server = axum::serve(metrics_listener, metrics_router(handle))
                 .with_graceful_shutdown(background.cancelled_owned());
             if let Err(e) = server.await {
-                tracing::error!(error = %e, "serveur de métriques arrêté");
+                tracing::error!(error = %e, "metrics server stopped");
             }
         });
     }
@@ -153,19 +152,19 @@ pub async fn serve(
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             stop.cancelled().await;
-            // Dès le signal : on se déclare « non prêt » ; axum arrête d'accepter et attend la
-            // fin des requêtes en cours.
+            // As soon as the signal arrives: report "not ready"; axum stops accepting and
+            // waits for in-flight requests to finish.
             drain_state.ready.store(false, Ordering::Release);
-            tracing::info!("arrêt demandé : drain des requêtes en cours");
+            tracing::info!("shutdown requested: draining in-flight requests");
         })
         .await?;
 
     background.cancel();
-    tracing::info!("arrêt terminé");
+    tracing::info!("shutdown complete");
     Ok(())
 }
 
-/// Attend SIGTERM (Kubernetes) ou Ctrl-C (local).
+/// Waits for SIGTERM (Kubernetes) or Ctrl-C (local).
 pub async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -187,7 +186,7 @@ pub async fn shutdown_signal() {
     }
 }
 
-/// Adresse locale d'un écouteur (pour les logs).
+/// Local address of a listener (for logs).
 pub fn local_addr(listener: &TcpListener) -> Option<SocketAddr> {
     listener.local_addr().ok()
 }

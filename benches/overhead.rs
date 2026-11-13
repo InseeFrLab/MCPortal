@@ -1,20 +1,20 @@
-//! # Mesure de l'overhead de la passerelle
+//! # Gateway overhead measurement
 //!
-//! On compare le même appel d'outil (`echo`) sur un serveur MCP simulé :
+//! Compares the same tool call (`echo`) on a mock MCP server:
 //!
-//! - `direct`      : client ──▶ amont ;
-//! - `via_gateway` : client ──▶ passerelle ──▶ amont (via `call_tool`).
+//! - `direct`      : client ──▶ upstream;
+//! - `via_gateway` : client ──▶ gateway ──▶ upstream (through `call_tool`).
 //!
-//! La différence des deux temps est le coût ajouté par la passerelle : un saut HTTP local
-//! supplémentaire + résolution du nom + validation JSON Schema + sémaphores.
-//! Tout tourne en local (127.0.0.1) : le chiffre mesure la passerelle, pas le réseau.
+//! The difference between the two times is the cost added by the gateway: one extra local
+//! HTTP hop + name resolution + JSON Schema validation + semaphores.
+//! Everything runs locally (127.0.0.1): the figure measures the gateway, not the network.
 //!
 //! ```text
 //! cargo bench --bench overhead
 //! ```
 //!
-//! En production, la métrique `mcportal_gateway_overhead_seconds` donne la même mesure
-//! (temps total − temps amont) sur le trafic réel.
+//! In production, the `mcportal_gateway_overhead_seconds` metric gives the same measurement
+//! (total time − upstream time) on real traffic.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -36,7 +36,7 @@ fn overhead(c: &mut Criterion) {
         let gateway = spawn_gateway(config(&[("mock", &upstream)], "", "")).await;
         let direct = connect(&upstream).await;
         let via_gateway = connect(&gateway.url).await;
-        // Vérification préalable : les deux chemins répondent la même chose.
+        // Sanity check: both paths return the same thing.
         assert_eq!(
             text(&call(&direct, "echo", json!({"text": "x"})).await),
             "x"
@@ -51,18 +51,18 @@ fn overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("call_tool_echo");
     group.bench_function("direct", |b| {
         b.to_async(&rt)
-            .iter(|| call(&direct, "echo", json!({"text": "bonjour"})))
+            .iter(|| call(&direct, "echo", json!({"text": "hello"})))
     });
     group.bench_function("via_gateway", |b| {
         b.to_async(&rt)
-            .iter(|| call_via_gateway(&via_gateway, "mock_echo", json!({"text": "bonjour"})))
+            .iter(|| call_via_gateway(&via_gateway, "mock_echo", json!({"text": "hello"})))
     });
     group.finish();
 
-    // Recherche seule (pas d'appel amont) : coût de BM25 sur un petit catalogue.
+    // Search only (no upstream call): BM25 cost on a small catalog.
     c.bench_function("search_tools", |b| {
         b.to_async(&rt)
-            .iter(|| call(&via_gateway, "search_tools", json!({"query": "écho texte"})))
+            .iter(|| call(&via_gateway, "search_tools", json!({"query": "echo text"})))
     });
 
     ct.cancel();

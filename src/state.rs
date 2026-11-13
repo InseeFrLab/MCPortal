@@ -1,34 +1,34 @@
-//! # État partagé de la passerelle
+//! # Shared gateway state
 //!
-//! [`AppState`] est créé une fois au démarrage et partagé (via `Arc`) par toutes les requêtes.
-//! Il contient deux sortes de données :
+//! [`AppState`] is created once at startup and shared (through `Arc`) by every request.
+//! It holds two kinds of data:
 //!
-//! 1. des données **fixes** pour la vie du pod : la config, les [`Upstream`], les limites ;
-//! 2. un **catalogue d'outils** ([`ToolCatalog`]) qui change quand un amont publie de
-//!    nouveaux outils. Il est rangé derrière un [`ArcSwap`].
+//! 1. data that is **fixed** for the pod's lifetime: the config, the [`Upstream`]s, the limits;
+//! 2. a **tool catalog** ([`ToolCatalog`]) that changes when an upstream publishes new
+//!    tools. It is stored behind an [`ArcSwap`].
 //!
-//! ## Pourquoi `ArcSwap` ?
+//! ## Why `ArcSwap`?
 //!
-//! Le catalogue est lu à **chaque** requête et réécrit **rarement** (rafraîchissement toutes
-//! les `cache_ttl` secondes). `ArcSwap` est fait pour ça :
+//! The catalog is read on **every** request and rewritten **rarely** (refresh every
+//! `cache_ttl` seconds). `ArcSwap` is made for this:
 //!
-//! - lecture : `catalog.load()` renvoie un pointeur vers la version courante, sans verrou
-//!   (quelques nanosecondes) ;
-//! - écriture : on construit un **nouveau** catalogue complet à côté, puis `store()` le
-//!   publie atomiquement. Les requêtes en cours gardent l'ancienne version jusqu'à leur fin.
+//! - read: `catalog.load()` returns a pointer to the current version, lock-free (a few
+//!   nanoseconds);
+//! - write: a **new** complete catalog is built alongside, then `store()` publishes it
+//!   atomically. In-flight requests keep the old version until they finish.
 //!
-//! Aucune requête ne voit donc jamais un catalogue « à moitié reconstruit ».
+//! No request ever sees a "half-rebuilt" catalog.
 //!
-//! ## Boucle de rafraîchissement
+//! ## Refresh loop
 //!
-//! Une tâche par amont activé ([`spawn_refresh_loops`]) se réveille toutes les
-//! `probe_interval_seconds` :
+//! One task per enabled upstream ([`spawn_refresh_loops`]) wakes up every
+//! `probe_interval_seconds`:
 //!
-//! - si le cache d'outils a dépassé `cache_ttl` → `tools/list` complet, et reconstruction du
-//!   catalogue si la liste a changé ;
-//! - sinon → sonde légère (première page de `tools/list`).
+//! - if the tool cache is older than `cache_ttl` → full `tools/list`, and catalog rebuild if
+//!   the list changed;
+//! - otherwise → lightweight probe (first page of `tools/list`).
 //!
-//! Dans les deux cas le résultat met à jour la santé de l'amont.
+//! In both cases the result updates the upstream's health.
 
 use std::{
     collections::BTreeMap,
@@ -51,23 +51,23 @@ use crate::{
     upstream::{Availability, Upstream},
 };
 
-/// Un outil tel qu'exposé par la passerelle.
+/// A tool as exposed by the gateway.
 pub struct ToolEntry {
-    /// Nom du serveur amont (= préfixe).
+    /// Name of the upstream server (= prefix).
     pub server: String,
-    /// Nom de l'outil **chez l'amont** (sans préfixe), utilisé pour l'appel amont.
+    /// Name of the tool **on the upstream** (without prefix), used for the upstream call.
     pub upstream_name: String,
-    /// Définition exposée : identique à l'amont, mais `name` = `{serveur}_{outil}`.
+    /// Exposed definition: identical to the upstream's, but `name` = `{server}_{tool}`.
     pub tool: Tool,
-    /// Validateur JSON Schema compilé à partir de `inputSchema` (None si le schéma est
-    /// invalide : on laisse alors l'amont valider lui-même).
+    /// JSON Schema validator compiled from `inputSchema` (None if the schema is invalid:
+    /// the upstream is then left to validate by itself).
     pub validator: Option<Arc<jsonschema::Validator>>,
 }
 
-/// Catalogue immuable : tous les outils exposés + l'index de recherche.
+/// Immutable catalog: every exposed tool + the search index.
 pub struct ToolCatalog {
-    /// Clé = nom exposé. `BTreeMap` → ordre déterministe pour `tools/list` (recommandé par la
-    /// spec 2026-07-28 pour le cache des prompts côté client).
+    /// Key = exposed name. `BTreeMap` → deterministic order for `tools/list` (recommended by
+    /// the 2026-07-28 spec for client-side prompt caching).
     pub tools: BTreeMap<String, ToolEntry>,
     pub index: Box<dyn ToolIndex>,
 }
@@ -81,23 +81,23 @@ impl ToolCatalog {
     }
 }
 
-/// Construit le nom exposé d'un outil amont.
+/// Builds the exposed name of an upstream tool.
 pub fn exposed_name(server: &str, tool: &str) -> String {
     format!("{server}_{tool}")
 }
 
-/// État global. Voir la documentation du module.
+/// Global state. See the module documentation.
 pub struct AppState {
     pub config: Arc<Config>,
-    /// **Tous** les serveurs du registre, y compris désactivés (visibles dans le catalogue).
+    /// **All** registry servers, including disabled ones (visible in the catalog).
     pub upstreams: BTreeMap<String, Arc<Upstream>>,
     pub limits: Limits,
     pub catalog: ArcSwap<ToolCatalog>,
-    /// Passe à `true` après la première tentative de chargement des outils, et repasse à
-    /// `false` au début de l'arrêt du pod (voir `/ready`).
+    /// Becomes `true` after the first tool load attempt, and goes back to `false` when the
+    /// pod starts shutting down (see `/ready`).
     pub ready: AtomicBool,
-    /// Sérialise les reconstructions du catalogue (deux amonts qui se rafraîchissent en même
-    /// temps ne doivent pas publier une version périmée l'un après l'autre).
+    /// Serializes catalog rebuilds (two upstreams refreshing at the same time must not
+    /// publish a stale version one after the other).
     rebuild_lock: tokio::sync::Mutex<()>,
 }
 
@@ -127,16 +127,16 @@ impl AppState {
         self.ready.load(Ordering::Acquire)
     }
 
-    /// Serveurs activés uniquement.
+    /// Enabled servers only.
     pub fn enabled_upstreams(&self) -> impl Iterator<Item = &Arc<Upstream>> {
         self.upstreams.values().filter(|u| u.config.enabled)
     }
 
-    /// Reconstruit le catalogue à partir des caches d'outils des amonts, puis le publie.
+    /// Rebuilds the catalog from the upstreams' tool caches, then publishes it.
     pub async fn rebuild_catalog(&self) {
         let _guard = self.rebuild_lock.lock().await;
 
-        // 1. Rassembler les outils de chaque amont activé (dernière liste connue).
+        // 1. Gather the tools of each enabled upstream (last known list).
         let mut tools: BTreeMap<String, ToolEntry> = BTreeMap::new();
         let mut server_texts: BTreeMap<String, String> = BTreeMap::new();
         for upstream in self.enabled_upstreams() {
@@ -146,9 +146,9 @@ impl AppState {
             server_texts.insert(upstream.name().to_owned(), server_text(upstream));
             for tool in upstream_tools.iter() {
                 let name = exposed_name(upstream.name(), &tool.name);
-                // Collision possible : serveur "a_b" + outil "c" et serveur "a" + outil "b_c".
+                // Possible collision: server "a_b" + tool "c" and server "a" + tool "b_c".
                 if tools.contains_key(&name) {
-                    tracing::warn!(tool = %name, server = upstream.name(), "nom d'outil exposé en double, ignoré");
+                    tracing::warn!(tool = %name, server = upstream.name(), "duplicate exposed tool name, ignored");
                     continue;
                 }
                 let mut exposed = tool.clone();
@@ -165,15 +165,15 @@ impl AppState {
             }
         }
 
-        // 2. Indexer.
+        // 2. Index.
         let index = Bm25ToolIndex::build(tools.iter().map(|(name, entry)| IndexEntry {
             exposed_name: name,
             tool: &entry.tool,
             server_text: &server_texts[&entry.server],
         }));
 
-        // 3. Publier atomiquement.
-        tracing::info!(tools = tools.len(), "catalogue d'outils reconstruit");
+        // 3. Publish atomically.
+        tracing::info!(tools = tools.len(), "tool catalog rebuilt");
         metrics::gauge!(metric::CATALOG_TOOLS).set(tools.len() as f64);
         self.catalog.store(Arc::new(ToolCatalog {
             tools,
@@ -181,7 +181,7 @@ impl AppState {
         }));
     }
 
-    /// Un cycle de rafraîchissement pour un amont (voir la documentation du module).
+    /// One refresh cycle for an upstream (see the module documentation).
     pub async fn refresh_upstream(&self, upstream: &Upstream) {
         let outcome = if upstream.cache_expired() {
             match upstream.fetch_tools().await {
@@ -197,7 +197,7 @@ impl AppState {
             upstream.probe().await
         };
         if let Err(e) = &outcome {
-            tracing::warn!(server = upstream.name(), error = %e, "sonde amont en échec");
+            tracing::warn!(server = upstream.name(), error = %e, "upstream probe failed");
         }
         upstream.record_probe(&outcome);
         let up = matches!(upstream.availability(), Availability::Available);
@@ -208,25 +208,24 @@ impl AppState {
         });
     }
 
-    /// Premier chargement : tous les amonts **en parallèle**, puis on se déclare prêt.
+    /// Initial load: all upstreams **in parallel**, then report ready.
     ///
-    /// On attend ce premier passage avant `/ready` = 200 pour qu'un nouveau pod (rolling
-    /// update) ne reçoive pas de trafic avec un catalogue vide. Un amont en échec ne bloque pas :
-    /// le délai est borné par son `timeout`.
+    /// This first pass is awaited before `/ready` = 200 so that a new pod (rolling update)
+    /// does not receive traffic with an empty catalog. A failing upstream does not block:
+    /// the wait is bounded by its `timeout`.
     pub async fn initial_load(&self) {
         let tasks = self.enabled_upstreams().map(|u| self.refresh_upstream(u));
         futures::future::join_all(tasks).await;
         self.ready.store(true, Ordering::Release);
-        tracing::info!("passerelle prête");
+        tracing::info!("gateway ready");
     }
 }
 
-/// Lance une tâche de rafraîchissement par amont activé. Elles s'arrêtent quand `shutdown`
-/// est annulé.
+/// Starts one refresh task per enabled upstream. They stop when `shutdown` is cancelled.
 pub fn spawn_refresh_loops(state: Arc<AppState>, shutdown: CancellationToken) {
     let health = &state.config.gateway.health;
     for upstream in state.enabled_upstreams() {
-        // Sans sondes de santé, on se réveille seulement pour rafraîchir le cache.
+        // Without health probes, wake up only to refresh the cache.
         let interval = if health.enabled {
             Duration::from_secs(health.probe_interval_seconds)
         } else {
@@ -245,7 +244,7 @@ pub fn spawn_refresh_loops(state: Arc<AppState>, shutdown: CancellationToken) {
     }
 }
 
-/// Texte décrivant un serveur, ajouté au document indexé de chacun de ses outils.
+/// Text describing a server, added to the indexed document of each of its tools.
 fn server_text(upstream: &Upstream) -> String {
     let c = &upstream.config;
     let mut parts = vec![c.name.clone()];
@@ -255,14 +254,14 @@ fn server_text(upstream: &Upstream) -> String {
     parts.join(" ")
 }
 
-/// Compile le JSON Schema d'entrée d'un outil. Un schéma que l'on ne sait pas compiler n'est
-/// pas bloquant : on log et on laisse l'amont valider.
+/// Compiles a tool's input JSON Schema. A schema that cannot be compiled is not blocking:
+/// log it and let the upstream validate.
 fn compile_validator(tool: &Tool) -> Option<Arc<jsonschema::Validator>> {
     let schema = serde_json::Value::Object((*tool.input_schema).clone());
     match jsonschema::validator_for(&schema) {
         Ok(v) => Some(Arc::new(v)),
         Err(e) => {
-            tracing::warn!(tool = %tool.name, error = %e, "inputSchema non compilable, validation déléguée à l'amont");
+            tracing::warn!(tool = %tool.name, error = %e, "inputSchema cannot be compiled, validation delegated to the upstream");
             None
         }
     }

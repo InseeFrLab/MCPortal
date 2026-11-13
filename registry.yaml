@@ -1,5 +1,5 @@
-# Registre de la passerelle MCPortal.
-# Toutes les clés sont documentées dans src/config.rs.
+# MCPortal gateway registry.
+# Every key is documented in src/config.rs.
 gateway:
   name: SSP Gateway
   tool_search: {enabled: true, max_results: 5}
@@ -10,18 +10,18 @@ gateway:
   http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
 
 servers:
-  - name: mcpdiffusion                        # sert aussi de préfixe d'outils
+  - name: mcpdiffusion                        # also used as the tool prefix
     url: https://mcpdiffusion.lab.sspcloud.fr/mcp
-    transport: http                           # http | sse (sse : déprécié, non supporté)
-    domain: diffusion                         # regroupement fonctionnel
-    description: Serveur pour exposer Melodi, Rmes et insee.fr
-    tags: [dataset, publications]             # liste ou chaîne unique
-    enabled: true                             # false : gardé au registre, non exposé
-    timeout: 30.0                             # délai par appel amont (s)
-    max_concurrency: 4                        # appels simultanés vers ce serveur
-    cache_ttl: 300                            # cache des listes d'outils (s)
+    transport: http                           # http | sse (sse: deprecated, not supported)
+    domain: diffusion                         # functional grouping
+    description: Server exposing Melodi, Rmes and insee.fr
+    tags: [dataset, publications]             # list or single string
+    enabled: true                             # false: kept in the registry, not exposed
+    timeout: 30.0                             # timeout per upstream call (s)
+    max_concurrency: 4                        # concurrent calls to this server
+    cache_ttl: 300                            # tool list cache (s)
 
-  # TODO : serveurs cités par guide-ssp.md, URL à renseigner :
+  # TODO: servers cited by guide-ssp.md, URLs to fill in:
   # - {name: insee,   url: …, domain: Insee}
   # - {name: melodi,  url: …, domain: Insee}
   # - {name: rmes,    url: …, domain: Insee}

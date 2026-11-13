@@ -1,31 +1,31 @@
-//! # MCPortal — passerelle MCP
+//! # MCPortal — MCP gateway
 //!
-//! MCPortal agrège plusieurs serveurs MCP « amont » (déclarés dans un registre YAML) et les
-//! expose à un client MCP « aval » (Claude, Claude Code…) sous la forme d'un seul serveur.
+//! MCPortal aggregates several "upstream" MCP servers (declared in a YAML registry) and
+//! exposes them to a "downstream" MCP client (Claude, Claude Code…) as a single server.
 //!
 //! ```text
-//!   client MCP ──HTTP──▶ ┌──────────── MCPortal ─────────────┐ ──HTTP──▶ amont « insee »
-//!   (aval)               │ gateway.rs   (handler MCP)        │ ──HTTP──▶ amont « melodi »
-//!                        │   ├─ search.rs  (BM25)            │ ──HTTP──▶ amont « geodata »
-//!                        │   ├─ catalog.rs (ressources)      │
-//!                        │   └─ limits.rs  (sémaphores)      │
-//!                        │ upstream.rs  (clients amont)      │
-//!                        │ state.rs     (catalogue partagé)  │
+//!   MCP client ──HTTP──▶ ┌──────────── MCPortal ─────────────┐ ──HTTP──▶ "insee" upstream
+//!   (downstream)         │ gateway.rs   (MCP handler)        │ ──HTTP──▶ "melodi" upstream
+//!                        │   ├─ search.rs  (BM25)            │ ──HTTP──▶ "geodata" upstream
+//!                        │   ├─ catalog.rs (resources)       │
+//!                        │   └─ limits.rs  (semaphores)      │
+//!                        │ upstream.rs  (upstream clients)   │
+//!                        │ state.rs     (shared catalog)     │
 //!                        └───────────────────────────────────┘
 //! ```
 //!
-//! Le binaire (`main.rs`) ne fait qu'assembler ces modules ; toute la logique vit dans la
-//! bibliothèque pour être testable (`tests/`) et mesurable (`benches/`).
+//! The binary (`main.rs`) only wires these modules together; all the logic lives in the
+//! library so that it can be tested (`tests/`) and measured (`benches/`).
 //!
-//! Ordre de lecture conseillé :
-//! 1. [`config`]    — ce que contient le registre YAML ;
-//! 2. [`upstream`]  — comment on parle à un serveur amont ;
-//! 3. [`state`]     — l'état partagé et son rafraîchissement ;
-//! 4. [`search`]    — l'index BM25 ;
-//! 5. [`gateway`]   — le serveur MCP exposé (outils + ressources) ;
-//! 6. [`catalog`]   — le contenu des ressources `catalog://…` ;
-//! 7. [`server`]    — l'assemblage HTTP (axum), `/health`, `/ready`, arrêt propre ;
-//! 8. [`telemetry`] — logs JSON et métriques Prometheus.
+//! Suggested reading order:
+//! 1. [`config`]    — what the YAML registry contains;
+//! 2. [`upstream`]  — how we talk to an upstream server;
+//! 3. [`state`]     — the shared state and its refresh;
+//! 4. [`search`]    — the BM25 index;
+//! 5. [`gateway`]   — the exposed MCP server (tools + resources);
+//! 6. [`catalog`]   — the content of the `catalog://…` resources;
+//! 7. [`server`]    — HTTP wiring (axum), `/health`, `/ready`, graceful shutdown;
+//! 8. [`telemetry`] — JSON logs and Prometheus metrics.
 
 pub mod catalog;
 pub mod config;

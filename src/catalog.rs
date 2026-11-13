@@ -1,20 +1,20 @@
-//! # Le catalogue (ressources `catalog://…`)
+//! # The catalog (`catalog://…` resources)
 //!
-//! Le catalogue est exposé en **ressources** MCP et non en outils : il ne coûte rien au
-//! contexte du client tant que celui-ci ne le lit pas, et il reste lisible quand la recherche
-//! d'outils masque `tools/list`.
+//! The catalog is exposed as MCP **resources**, not tools: it costs nothing in the client's
+//! context until the client reads it, and it stays readable when tool search hides
+//! `tools/list`.
 //!
-//! | URI | Contenu |
+//! | URI | Content |
 //! | --- | --- |
-//! | `catalog://servers` | tous les serveurs : domaine, description, tags, `enabled`, préfixe, limites, état |
-//! | `catalog://domains` | serveurs regroupés par domaine |
-//! | `catalog://servers/{name}` | détail d'un serveur + métriques (outils, sondes) |
-//! | `catalog://servers/{name}/tools` | inventaire : nom amont, nom à appeler, description, paramètres |
-//! | `catalog://guide` | guide d'utilisation (voir [`crate::guide`]) |
+//! | `catalog://servers` | all servers: domain, description, tags, `enabled`, prefix, limits, status |
+//! | `catalog://domains` | servers grouped by domain |
+//! | `catalog://servers/{name}` | details of a server + metrics (tools, probes) |
+//! | `catalog://servers/{name}/tools` | inventory: upstream name, name to call, description, parameters |
+//! | `catalog://guide` | usage guide (see [`crate::guide`]) |
 //!
-//! Toutes les réponses sont générées **à la lecture** à partir de l'état courant : il n'y a
-//! pas de seconde source de vérité. Un amont injoignable ne casse pas la ressource : elle
-//! répond `"status": "unavailable"` avec l'erreur.
+//! Every response is generated **on read** from the current state: there is no second
+//! source of truth. An unreachable upstream does not break the resource: it responds with
+//! `"status": "unavailable"` and the error.
 
 use std::collections::BTreeMap;
 
@@ -35,13 +35,13 @@ const DOMAINS: &str = "catalog://domains";
 const GUIDE: &str = "catalog://guide";
 const SERVER_PREFIX: &str = "catalog://servers/";
 
-/// Domaine des serveurs qui n'en déclarent pas.
-const NO_DOMAIN: &str = "(sans domaine)";
+/// Domain of servers that do not declare one.
+const NO_DOMAIN: &str = "(no domain)";
 
-/// Ressources listées par `resources/list`.
+/// Resources listed by `resources/list`.
 ///
-/// On liste aussi les ressources concrètes de chaque serveur (en plus des modèles) : certains
-/// clients ne savent pas exploiter les `resources/templates/list`.
+/// The concrete resources of each server are listed too (on top of the templates): some
+/// clients cannot use `resources/templates/list`.
 pub fn list_resources(state: &AppState) -> Vec<Resource> {
     let catalog = &state.config.gateway.catalog;
     if !catalog.enabled {
@@ -57,20 +57,18 @@ pub fn list_resources(state: &AppState) -> Vec<Resource> {
         json_resource(
             SERVERS.into(),
             "servers".into(),
-            "Tous les serveurs : domaine, description, tags, état de joignabilité, limites".into(),
+            "All servers: domain, description, tags, reachability status, limits".into(),
         ),
         json_resource(
             DOMAINS.into(),
             "domains".into(),
-            "Serveurs regroupés par domaine fonctionnel".into(),
+            "Servers grouped by functional domain".into(),
         ),
     ];
     if catalog.include_guide {
         resources.push(
             Resource::new(GUIDE, "guide")
-                .with_description(
-                    "Guide d'utilisation de la passerelle et démarches du déploiement",
-                )
+                .with_description("Gateway usage guide and deployment workflows")
                 .with_mime_type("text/markdown"),
         );
     }
@@ -78,20 +76,20 @@ pub fn list_resources(state: &AppState) -> Vec<Resource> {
         resources.push(json_resource(
             format!("{SERVER_PREFIX}{name}"),
             format!("server-{name}"),
-            format!("Détail et métriques du serveur {name}"),
+            format!("Details and metrics of server {name}"),
         ));
         if catalog.include_tool_inventory {
             resources.push(json_resource(
                 format!("{SERVER_PREFIX}{name}/tools"),
                 format!("server-{name}-tools"),
-                format!("Inventaire des outils du serveur {name}"),
+                format!("Tool inventory of server {name}"),
             ));
         }
     }
     resources
 }
 
-/// Modèles de ressources (`resources/templates/list`).
+/// Resource templates (`resources/templates/list`).
 pub fn list_templates(state: &AppState) -> Vec<ResourceTemplate> {
     let catalog = &state.config.gateway.catalog;
     if !catalog.enabled {
@@ -99,23 +97,23 @@ pub fn list_templates(state: &AppState) -> Vec<ResourceTemplate> {
     }
     let mut templates = vec![
         ResourceTemplate::new("catalog://servers/{name}", "server")
-            .with_description("Détail d'un serveur et ses métriques")
+            .with_description("Details of a server and its metrics")
             .with_mime_type("application/json"),
     ];
     if catalog.include_tool_inventory {
         templates.push(
             ResourceTemplate::new("catalog://servers/{name}/tools", "server-tools")
-                .with_description("Inventaire des outils d'un serveur (nom à appeler, paramètres)")
+                .with_description("Tool inventory of a server (name to call, parameters)")
                 .with_mime_type("application/json"),
         );
     }
     templates
 }
 
-/// Lit une ressource du catalogue.
+/// Reads a catalog resource.
 pub async fn read(state: &AppState, uri: &str) -> Result<ResourceContents, McpError> {
     let catalog = &state.config.gateway.catalog;
-    let not_found = || McpError::resource_not_found(format!("ressource inconnue: {uri}"), None);
+    let not_found = || McpError::resource_not_found(format!("unknown resource: {uri}"), None);
     if !catalog.enabled {
         return Err(not_found());
     }
@@ -126,11 +124,11 @@ pub async fn read(state: &AppState, uri: &str) -> Result<ResourceContents, McpEr
         GUIDE if catalog.include_guide => {
             let text = guide::render(&state.config)
                 .await
-                .map_err(|e| McpError::internal_error(format!("guide illisible: {e}"), None))?;
+                .map_err(|e| McpError::internal_error(format!("unreadable guide: {e}"), None))?;
             return Ok(ResourceContents::text(text, uri).with_mime_type("text/markdown"));
         }
         _ => {
-            // catalog://servers/{name} ou catalog://servers/{name}/tools
+            // catalog://servers/{name} or catalog://servers/{name}/tools
             let rest = uri.strip_prefix(SERVER_PREFIX).ok_or_else(not_found)?;
             let (name, tools) = match rest.strip_suffix("/tools") {
                 Some(name) => (name, true),
@@ -144,15 +142,15 @@ pub async fn read(state: &AppState, uri: &str) -> Result<ResourceContents, McpEr
             }
         }
     };
-    let text = serde_json::to_string_pretty(&value).expect("JSON sérialisable");
+    let text = serde_json::to_string_pretty(&value).expect("serializable JSON");
     Ok(ResourceContents::text(text, uri).with_mime_type("application/json"))
 }
 
 // ---------------------------------------------------------------------------------------------
-// Rendu JSON
+// JSON rendering
 // ---------------------------------------------------------------------------------------------
 
-/// Résumé d'un serveur, commun à `catalog://servers` et `catalog://servers/{name}`.
+/// Summary of a server, shared by `catalog://servers` and `catalog://servers/{name}`.
 fn server_summary(u: &Upstream) -> Value {
     let c = &u.config;
     let health = u.health_snapshot();
@@ -200,18 +198,18 @@ fn domains(state: &AppState) -> Value {
 
 fn server_detail(u: &Upstream) -> Value {
     let mut value = server_summary(u);
-    value["metrics"] = serde_json::to_value(u.health_snapshot()).expect("JSON sérialisable");
+    value["metrics"] = serde_json::to_value(u.health_snapshot()).expect("serializable JSON");
     value
 }
 
 fn tool_inventory(u: &Upstream) -> Value {
     let health = u.health_snapshot();
     let Some(tools) = u.cached_tools() else {
-        // Jamais réussi à lister les outils : on le dit au lieu d'échouer.
+        // Never managed to list the tools: say so instead of failing.
         return json!({
             "server": u.config.name,
             "status": health.status,
-            "error": health.last_error.or_else(|| (!u.config.enabled).then(|| "serveur désactivé".into())),
+            "error": health.last_error.or_else(|| (!u.config.enabled).then(|| "server disabled".into())),
             "tools": [],
         });
     };

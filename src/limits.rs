@@ -1,22 +1,21 @@
-//! # Limites de concurrence
+//! # Concurrency limits
 //!
-//! V1 : limites **globales**, non liées à l'utilisateur (pas d'authentification).
-//! Deux sémaphores sont acquis l'un après l'autre avant chaque appel amont :
+//! V1: **global** limits, not tied to the user (no authentication).
+//! Two semaphores are acquired one after the other before each upstream call:
 //!
 //! ```text
-//!   appel ──▶ [global: gateway.concurrency.global_limit] ──▶ [serveur: max_concurrency] ──▶ amont
+//!   call ──▶ [global: gateway.concurrency.global_limit] ──▶ [server: max_concurrency] ──▶ upstream
 //! ```
 //!
-//! Un sémaphore est un compteur de « places » : `acquire` attend qu'une place se libère, et la
-//! place est rendue automatiquement quand le permis (`SemaphorePermit`) est détruit, c'est-à-dire
-//! à la fin de l'appel, même en cas d'erreur ou d'annulation.
+//! A semaphore is a counter of "permits": `acquire` waits for a permit to become free, and the
+//! permit is returned automatically when the `SemaphorePermit` is dropped, i.e. at the end of
+//! the call, even on error or cancellation.
 //!
-//! On n'attend jamais indéfiniment : au-delà de `acquire_timeout_seconds`, l'appel est refusé
-//! avec un message explicite (« passerelle saturée ») que le LLM peut comprendre.
+//! We never wait indefinitely: past `acquire_timeout_seconds`, the call is rejected with an
+//! explicit message ("gateway saturated") that the LLM can understand.
 //!
-//! L'ordre global → serveur est important : on ne prend jamais de place « serveur » sans avoir
-//! déjà une place « globale », ce qui évite qu'un serveur lent monopolise des places globales en
-//! attendant.
+//! The global → server order matters: we never take a "server" permit without already holding
+//! a "global" one, which prevents a slow server from hogging global permits while waiting.
 
 use std::time::Duration;
 
@@ -24,27 +23,25 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::{telemetry::metric, upstream::Upstream};
 
-/// Appel refusé faute de place.
+/// Call rejected for lack of a free permit.
 #[derive(Debug, thiserror::Error)]
 pub enum Rejected {
-    #[error(
-        "passerelle saturée ({limit} appels simultanés au maximum) : réessayez dans quelques secondes"
-    )]
+    #[error("gateway saturated (at most {limit} concurrent calls): try again in a few seconds")]
     Global { limit: usize },
     #[error(
-        "le serveur '{server}' est saturé ({limit} appels simultanés au maximum) : réessayez dans quelques secondes"
+        "server '{server}' is saturated (at most {limit} concurrent calls): try again in a few seconds"
     )]
     Server { server: String, limit: usize },
 }
 
-/// Limites globales de la passerelle.
+/// Global limits of the gateway.
 pub struct Limits {
     global: Semaphore,
     global_limit: usize,
     acquire_timeout: Duration,
 }
 
-/// Places obtenues pour un appel. Les rendre = détruire cette valeur.
+/// Permits obtained for a call. Dropping this value releases them.
 pub struct CallPermit<'a> {
     _global: SemaphorePermit<'a>,
     _server: SemaphorePermit<'a>,
@@ -66,8 +63,8 @@ impl Limits {
         }
     }
 
-    /// Acquiert une place globale puis une place sur `upstream`, dans le délai configuré
-    /// (le délai couvre les **deux** attentes).
+    /// Acquires a global permit then a permit on `upstream`, within the configured timeout
+    /// (the timeout covers **both** waits).
     pub async fn acquire<'a>(&'a self, upstream: &'a Upstream) -> Result<CallPermit<'a>, Rejected> {
         let deadline = tokio::time::Instant::now() + self.acquire_timeout;
         let server = upstream.name().to_owned();
@@ -75,7 +72,7 @@ impl Limits {
         let global = tokio::time::timeout_at(deadline, self.global.acquire())
             .await
             .ok()
-            .and_then(Result::ok) // Err = sémaphore fermé, n'arrive pas ici
+            .and_then(Result::ok) // Err = semaphore closed, cannot happen here
             .ok_or_else(|| {
                 metrics::counter!(metric::RATELIMIT_REJECTIONS, "scope" => "global").increment(1);
                 Rejected::Global {

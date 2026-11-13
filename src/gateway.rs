@@ -1,43 +1,43 @@
-//! # Le serveur MCP exposé aux clients (aval)
+//! # The MCP server exposed to (downstream) clients
 //!
-//! [`Gateway`] implémente le trait `ServerHandler` de rmcp : rmcp s'occupe du protocole
-//! (JSON-RPC, transport HTTP, négociation de version) et appelle nos méthodes pour chaque
-//! requête. On implémente le trait **à la main** (sans les macros `#[tool]`) parce que la
-//! liste des outils exposés est dynamique : elle dépend des amonts.
+//! [`Gateway`] implements rmcp's `ServerHandler` trait: rmcp handles the protocol (JSON-RPC,
+//! HTTP transport, version negotiation) and calls our methods for each request. The trait is
+//! implemented **by hand** (without the `#[tool]` macros) because the list of exposed tools
+//! is dynamic: it depends on the upstreams.
 //!
-//! ## Outils exposés
+//! ## Exposed tools
 //!
-//! | `tool_search.enabled` | `tools/list` renvoie |
+//! | `tool_search.enabled` | `tools/list` returns |
 //! | --- | --- |
-//! | `true` (défaut) | `search_tools`, `call_tool`, `send_feedback` |
-//! | `false` | `send_feedback` + tous les outils amont, sous leur nom `{serveur}_{outil}` |
+//! | `true` (default) | `search_tools`, `call_tool`, `send_feedback` |
+//! | `false` | `send_feedback` + every upstream tool, under its name `{server}_{tool}` |
 //!
-//! Dans les deux modes, un appel direct à `{serveur}_{outil}` est accepté.
+//! In both modes, a direct call to `{server}_{tool}` is accepted.
 //!
-//! ## Typage de `call_tool`
+//! ## Typing of `call_tool`
 //!
-//! Les arguments de l'outil cible ne sont connus qu'à l'exécution (son `inputSchema`) : on ne
-//! peut pas les typer statiquement. On reprend donc **exactement** la forme du protocole
-//! (`CallToolRequestParams` : `name` + `arguments` objet JSON) — voir [`CallToolArgs`] — et on
-//! valide `arguments` contre le schéma de l'outil cible avant de l'appeler.
+//! The target tool's arguments are only known at runtime (its `inputSchema`): they cannot be
+//! typed statically. So we mirror the protocol shape **exactly** (`CallToolRequestParams`:
+//! `name` + `arguments` JSON object) — see [`CallToolArgs`] — and validate `arguments`
+//! against the target tool's schema before calling it.
 //!
-//! ## Deux niveaux d'erreur (recommandation de la spec MCP)
+//! ## Two levels of error (as recommended by the MCP spec)
 //!
-//! - **Erreur d'outil** (`CallToolResult { isError: true }`) : tout ce que le LLM peut
-//!   corriger ou contourner — outil inconnu, arguments invalides, amont injoignable, timeout,
-//!   saturation. Le message est rédigé pour lui.
-//! - **Erreur JSON-RPC** (`Err(McpError)`) : requêtes mal formées (paramètres de nos propres
-//!   outils non désérialisables). Les clients les affichent souvent de façon opaque.
+//! - **Tool error** (`CallToolResult { isError: true }`): anything the LLM can fix or work
+//!   around — unknown tool, invalid arguments, unreachable upstream, timeout, saturation.
+//!   The message is written for it.
+//! - **JSON-RPC error** (`Err(McpError)`): malformed requests (parameters of our own tools
+//!   that cannot be deserialized). Clients often display them opaquely.
 //!
-//! ## Cycle d'une requête `call_tool`
+//! ## Lifecycle of a `call_tool` request
 //!
 //! ```text
-//! 1. lire le catalogue courant (ArcSwap::load, sans verrou)
-//! 2. résoudre le nom exposé → (serveur, nom amont)        sinon : erreur + noms proches
-//! 3. valider les arguments (JSON Schema compilé)           sinon : erreur détaillée
-//! 4. acquérir les places (global puis serveur)             sinon : « saturé »
-//! 5. appeler l'amont (timeout, progression, annulation)
-//! 6. renvoyer le résultat amont TEL QUEL (content, structuredContent, isError, _meta…)
+//! 1. read the current catalog (ArcSwap::load, lock-free)
+//! 2. resolve the exposed name → (server, upstream name)   otherwise: error + close names
+//! 3. validate the arguments (compiled JSON Schema)        otherwise: detailed error
+//! 4. acquire permits (global then server)                 otherwise: "saturated"
+//! 5. call the upstream (timeout, progress, cancellation)
+//! 6. return the upstream result AS IS (content, structuredContent, isError, _meta…)
 //! ```
 
 use std::{sync::Arc, time::Instant};
@@ -59,49 +59,49 @@ use serde_json::{Value, json};
 
 use crate::{catalog, state::AppState, telemetry::metric};
 
-/// Nom des outils propres à la passerelle.
+/// Names of the gateway's own tools.
 pub const SEARCH_TOOLS: &str = "search_tools";
 pub const CALL_TOOL: &str = "call_tool";
 pub const SEND_FEEDBACK: &str = "send_feedback";
 
 // ---------------------------------------------------------------------------------------------
-// Arguments des outils de la passerelle
+// Arguments of the gateway's tools
 // ---------------------------------------------------------------------------------------------
-// Les `///` sur les champs deviennent les descriptions du JSON Schema exposé au client
-// (via `schemars`) : ils sont donc rédigés pour le LLM.
+// The `///` comments on fields become the descriptions of the JSON Schema exposed to the
+// client (through `schemars`): they are therefore written for the LLM.
 
-/// Arguments de `search_tools`.
+/// Arguments of `search_tools`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchToolsArgs {
-    /// Mots-clés décrivant ce que vous voulez faire, de préférence en français
-    /// (ex. « géocoder une adresse », « jeux de données population »).
+    /// Keywords describing what you want to do, preferably in the language of the tool
+    /// descriptions (e.g. "geocode an address", "population datasets").
     pub query: String,
-    /// Nombre maximal de résultats (plafonné par la configuration de la passerelle).
+    /// Maximum number of results (capped by the gateway configuration).
     #[serde(default)]
     pub limit: Option<usize>,
 }
 
-/// Arguments de `call_tool` : même forme que `CallToolRequestParams` du protocole MCP.
+/// Arguments of `call_tool`: same shape as the MCP protocol's `CallToolRequestParams`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CallToolArgs {
-    /// Nom complet de l'outil à appeler, tel que renvoyé par search_tools : "{serveur}_{outil}".
+    /// Full name of the tool to call, as returned by search_tools: "{server}_{tool}".
     pub name: String,
-    /// Arguments de l'outil : un objet JSON conforme à son inputSchema (pas une chaîne).
+    /// The tool's arguments: a JSON object matching its inputSchema (not a string).
     #[serde(default)]
     pub arguments: JsonObject,
 }
 
-/// Arguments de `send_feedback`.
+/// Arguments of `send_feedback`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SendFeedbackArgs {
-    /// Nom du serveur concerné (un serveur du registre, voir catalog://servers).
+    /// Name of the server concerned (a registry server, see catalog://servers).
     pub server: String,
-    /// Auteur du retour (nom, identifiant ou rôle).
+    /// Author of the feedback (name, identifier or role).
     pub author: String,
-    /// Le retour : problème rencontré, comportement inattendu, suggestion…
+    /// The feedback: problem encountered, unexpected behavior, suggestion…
     pub feedback: String,
 }
 
@@ -109,7 +109,7 @@ pub struct SendFeedbackArgs {
 // Handler
 // ---------------------------------------------------------------------------------------------
 
-/// Handler MCP de la passerelle. Cloné à bas coût (un `Arc`) pour chaque requête HTTP.
+/// The gateway's MCP handler. Cheaply cloned (an `Arc`) for each HTTP request.
 #[derive(Clone)]
 pub struct Gateway {
     state: Arc<AppState>,
@@ -124,50 +124,50 @@ impl Gateway {
         self.state.config.gateway.tool_search.enabled
     }
 
-    /// Définitions des outils propres à la passerelle.
+    /// Definitions of the gateway's own tools.
     fn gateway_tools(&self) -> Vec<Tool> {
         let mut tools = Vec::new();
         if self.search_enabled() {
             tools.push(Tool::new(
                 SEARCH_TOOLS,
-                "Recherche des outils parmi tous les serveurs de la passerelle (recherche plein texte). \
-                 Renvoie pour chaque outil son nom à appeler et son inputSchema. \
-                 À utiliser avant call_tool.",
+                "Searches for tools across all the gateway's servers (full-text search). \
+                 Returns, for each tool, the name to call and its inputSchema. \
+                 Use it before call_tool.",
                 schema_for_type::<SearchToolsArgs>(),
             ));
             tools.push(Tool::new(
                 CALL_TOOL,
-                "Appelle un outil d'un serveur de la passerelle. `name` est le nom complet renvoyé par \
-                 search_tools ({serveur}_{outil}) ; `arguments` est un objet JSON conforme à son inputSchema.",
+                "Calls a tool of one of the gateway's servers. `name` is the full name returned by \
+                 search_tools ({server}_{tool}); `arguments` is a JSON object matching its inputSchema.",
                 schema_for_type::<CallToolArgs>(),
             ));
         }
         tools.push(Tool::new(
             SEND_FEEDBACK,
-            "Signale un problème ou une remarque concernant un serveur de la passerelle. \
-             Le retour est consigné dans le journal de la passerelle.",
+            "Reports a problem or a remark about one of the gateway's servers. \
+             The feedback is recorded in the gateway log.",
             schema_for_type::<SendFeedbackArgs>(),
         ));
         tools
     }
 
-    /// Instructions envoyées au client à la connexion : la mécanique en bref + la liste des
-    /// serveurs (générée depuis le registre, jamais écrite à la main).
+    /// Instructions sent to the client on connection: the mechanics in brief + the list of
+    /// servers (generated from the registry, never written by hand).
     fn instructions(&self) -> String {
         let cfg = &self.state.config;
         let mut text = format!(
-            "{} : passerelle MCP qui agrège plusieurs serveurs.\n",
+            "{}: MCP gateway that aggregates several servers.\n",
             cfg.gateway.name
         );
         if self.search_enabled() {
             text.push_str(
-                "Les outils des serveurs ne sont pas listés directement : cherchez-les avec \
-                 search_tools, puis appelez-les avec call_tool (nom complet {serveur}_{outil}).\n",
+                "The servers' tools are not listed directly: search for them with \
+                 search_tools, then call them with call_tool (full name {server}_{tool}).\n",
             );
         } else {
-            text.push_str("Les outils des serveurs sont exposés sous le nom {serveur}_{outil}.\n");
+            text.push_str("The servers' tools are exposed under the name {server}_{tool}.\n");
         }
-        text.push_str("\nServeurs disponibles :\n");
+        text.push_str("\nAvailable servers:\n");
         for s in cfg.enabled_servers() {
             let domain = s
                 .domain
@@ -175,17 +175,17 @@ impl Gateway {
                 .map(|d| format!(" [{d}]"))
                 .unwrap_or_default();
             let description = s.description.as_deref().unwrap_or("");
-            text.push_str(&format!("- {}{domain} : {description}\n", s.name));
+            text.push_str(&format!("- {}{domain}: {description}\n", s.name));
         }
         let catalog = &cfg.gateway.catalog;
         if catalog.enabled {
-            text.push_str("\nCatalogue en ressources : catalog://servers, catalog://domains");
+            text.push_str("\nCatalog as resources: catalog://servers, catalog://domains");
             if catalog.include_tool_inventory {
-                text.push_str(", catalog://servers/{nom}/tools");
+                text.push_str(", catalog://servers/{name}/tools");
             }
             text.push('.');
             if catalog.include_guide {
-                text.push_str(" Lisez catalog://guide pour le mode d'emploi détaillé.");
+                text.push_str(" Read catalog://guide for detailed usage instructions.");
             }
             text.push('\n');
         }
@@ -206,8 +206,8 @@ impl Gateway {
             .into_iter()
             .filter_map(|hit| catalog.tools.get(&hit.name).map(|entry| (hit, entry)))
             .map(|(hit, entry)| {
-                // On renvoie l'inputSchema complet : sans lui, le LLM ne peut pas construire
-                // les `arguments` de call_tool correctement.
+                // Return the full inputSchema: without it, the LLM cannot build call_tool's
+                // `arguments` correctly.
                 json!({
                     "name": hit.name,
                     "server": entry.server,
@@ -222,12 +222,11 @@ impl Gateway {
 
         let mut value = json!({ "query": args.query, "results": results });
         if results.is_empty() {
-            value["hint"] = json!(
-                "Aucun outil trouvé : reformulez avec d'autres mots-clés ou consultez catalog://servers."
-            );
+            value["hint"] =
+                json!("No tool found: rephrase with other keywords or check catalog://servers.");
         }
-        // `structured` remplit structuredContent ET un bloc texte avec le même JSON (pour les
-        // clients qui ne lisent que `content`).
+        // `structured` fills structuredContent AND a text block with the same JSON (for
+        // clients that only read `content`).
         CallToolResult::structured(value)
     }
 
@@ -237,12 +236,12 @@ impl Gateway {
         if !self.state.upstreams.contains_key(&args.server) {
             let known: Vec<&str> = self.state.upstreams.keys().map(String::as_str).collect();
             return tool_error(format!(
-                "serveur inconnu '{}'. Serveurs du registre : {}",
+                "unknown server '{}'. Registry servers: {}",
                 args.server,
                 known.join(", ")
             ));
         }
-        // Le label FEEDBACK permet de filtrer ces lignes dans Loki/Grafana.
+        // The FEEDBACK label makes it possible to filter these lines in Loki/Grafana.
         tracing::info!(
             label = "FEEDBACK",
             server = %args.server,
@@ -252,13 +251,13 @@ impl Gateway {
         );
         metrics::counter!(metric::FEEDBACKS, "server" => args.server.clone()).increment(1);
         CallToolResult::success(vec![ContentBlock::text(
-            "Merci, votre retour a été consigné.",
+            "Thank you, your feedback has been recorded.",
         )])
     }
 
-    // --- call_tool (relais vers un amont) -------------------------------------------------
+    // --- call_tool (relay to an upstream) ------------------------------------------------
 
-    /// Relaie un appel vers l'outil amont `name`. Voir « Cycle d'une requête » plus haut.
+    /// Relays a call to the upstream tool `name`. See "Lifecycle of a request" above.
     async fn forward(
         &self,
         name: &str,
@@ -268,7 +267,7 @@ impl Gateway {
     ) -> CallToolResponse {
         let started = Instant::now();
 
-        // 1-2. Résolution du nom dans le catalogue courant.
+        // 1-2. Resolve the name in the current catalog.
         let catalog = self.state.catalog.load();
         let Some(entry) = catalog.tools.get(name) else {
             let suggestions: Vec<String> = catalog
@@ -278,19 +277,19 @@ impl Gateway {
                 .map(|h| h.name)
                 .collect();
             let hint = if suggestions.is_empty() {
-                "Utilisez search_tools pour trouver le bon nom.".to_owned()
+                "Use search_tools to find the right name.".to_owned()
             } else {
                 format!(
-                    "Noms proches : {}. Utilisez search_tools en cas de doute.",
+                    "Close names: {}. Use search_tools if in doubt.",
                     suggestions.join(", ")
                 )
             };
             record_call("unknown", name, "invalid", started, None);
-            return tool_error(format!("outil inconnu '{name}'. {hint}")).into();
+            return tool_error(format!("unknown tool '{name}'. {hint}")).into();
         };
         let server = entry.server.as_str();
 
-        // 3. Validation des arguments contre l'inputSchema de l'outil cible.
+        // 3. Validate the arguments against the target tool's inputSchema.
         let arguments = Value::Object(arguments);
         if let Some(validator) = &entry.validator {
             let errors: Vec<String> = validator
@@ -298,17 +297,17 @@ impl Gateway {
                 .map(|e| {
                     let path = e.instance_path().to_string();
                     let path = if path.is_empty() {
-                        "(racine)".to_owned()
+                        "(root)".to_owned()
                     } else {
                         path
                     };
-                    format!("- {path} : {e}")
+                    format!("- {path}: {e}")
                 })
                 .collect();
             if !errors.is_empty() {
                 record_call(server, name, "invalid", started, None);
                 return tool_error(format!(
-                    "arguments invalides pour '{name}' :\n{}\nConsultez son inputSchema (search_tools).",
+                    "invalid arguments for '{name}':\n{}\nCheck its inputSchema (search_tools).",
                     errors.join("\n")
                 ))
                 .into();
@@ -318,7 +317,7 @@ impl Gateway {
             unreachable!()
         };
 
-        // 4. Places de concurrence (rendues automatiquement à la fin de la fonction).
+        // 4. Concurrency permits (released automatically at the end of the function).
         let upstream = &self.state.upstreams[server];
         let _permit = match self.state.limits.acquire(upstream).await {
             Ok(permit) => permit,
@@ -328,8 +327,8 @@ impl Gateway {
             }
         };
 
-        // 5. Appel amont. On retransmet les champs MRTR (inputResponses / requestState) pour
-        //    qu'un échange multi-tours amont ↔ client aval fonctionne à travers la passerelle.
+        // 5. Upstream call. The MRTR fields (inputResponses / requestState) are forwarded so
+        //    that a multi-round upstream ↔ downstream client exchange works through the gateway.
         let mut params = CallToolRequestParams::new(entry.upstream_name.clone());
         params.arguments = Some(arguments);
         params.input_responses = original.input_responses.clone();
@@ -342,16 +341,16 @@ impl Gateway {
         let upstream_started = Instant::now();
         let outcome = tokio::select! {
             r = upstream.call_tool(params, progress) => Some(r),
-            // Le client aval a annulé : on abandonne l'appel amont (rmcp le notifie à l'amont).
+            // The downstream client cancelled: drop the upstream call (rmcp notifies the upstream).
             _ = context.ct.cancelled() => None,
         };
         let upstream_elapsed = upstream_started.elapsed();
 
-        // 6. Résultat amont renvoyé tel quel ; erreurs de transport → erreur d'outil.
+        // 6. Upstream result returned as is; transport errors → tool error.
         match outcome {
             None => {
                 record_call(server, name, "cancelled", started, Some(upstream_elapsed));
-                tool_error("appel annulé par le client".to_owned()).into()
+                tool_error("call cancelled by the client".to_owned()).into()
             }
             Some(Ok(response)) => {
                 let status = match &response {
@@ -368,7 +367,7 @@ impl Gateway {
                 };
                 record_call(server, name, status, started, Some(upstream_elapsed));
                 tool_error(format!(
-                    "{e}. Consultez catalog://servers pour l'état des serveurs."
+                    "{e}. Check catalog://servers for the servers' status."
                 ))
                 .into()
             }
@@ -376,23 +375,22 @@ impl Gateway {
     }
 }
 
-/// Résultat d'erreur lisible par le LLM (`isError: true`).
+/// Error result readable by the LLM (`isError: true`).
 fn tool_error(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
-/// Désérialise les arguments d'un outil de la passerelle. Échec = requête mal formée
-/// → erreur JSON-RPC `invalid_params`.
+/// Deserializes the arguments of a gateway tool. Failure = malformed request
+/// → JSON-RPC `invalid_params` error.
 fn parse_args<T: serde::de::DeserializeOwned>(
     tool: &str,
     arguments: Option<JsonObject>,
 ) -> Result<T, McpError> {
-    serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|e| {
-        McpError::invalid_params(format!("arguments invalides pour {tool}: {e}"), None)
-    })
+    serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
+        .map_err(|e| McpError::invalid_params(format!("invalid arguments for {tool}: {e}"), None))
 }
 
-/// Log + métriques d'un appel relayé.
+/// Log + metrics of a relayed call.
 fn record_call(
     server: &str,
     tool: &str,
@@ -415,7 +413,7 @@ fn record_call(
         status,
         duration_ms = total.as_millis() as u64,
         upstream_ms = upstream_elapsed.map(|d| d.as_millis() as u64),
-        "appel d'outil"
+        "tool call"
     );
 }
 
@@ -442,12 +440,12 @@ impl ServerHandler for Gateway {
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = self.gateway_tools();
         let ttl_ms = if self.search_enabled() {
-            // Les trois outils de la passerelle ne changent pas pendant la vie du pod.
+            // The gateway's three tools do not change during the pod's lifetime.
             3_600_000
         } else {
             let catalog = self.state.catalog.load();
             tools.extend(catalog.tools.values().map(|e| e.tool.clone()));
-            // Les outils amont peuvent changer au prochain rafraîchissement.
+            // Upstream tools may change at the next refresh.
             let min_ttl = self
                 .state
                 .enabled_upstreams()
@@ -455,7 +453,7 @@ impl ServerHandler for Gateway {
                 .min();
             min_ttl.unwrap_or(300) * 1000
         };
-        // La liste est la même pour tous les clients → cache partagé autorisé (`public`).
+        // The list is the same for every client → shared cache allowed (`public`).
         Ok(ListToolsResult::with_all_items(tools)
             .with_ttl_ms(ttl_ms)
             .with_cache_scope(CacheScope::Public))
@@ -482,7 +480,7 @@ impl ServerHandler for Gateway {
                 let args: SendFeedbackArgs = parse_args(SEND_FEEDBACK, request.arguments.clone())?;
                 Ok(self.send_feedback(args).into())
             }
-            // Appel direct d'un outil amont par son nom exposé.
+            // Direct call of an upstream tool by its exposed name.
             name => {
                 let arguments = request.arguments.clone().unwrap_or_default();
                 Ok(self.forward(name, arguments, &request, &context).await)
@@ -495,7 +493,7 @@ impl ServerHandler for Gateway {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        // Les ressources dépendent du registre (fixe pour la vie du pod) : cache d'une heure.
+        // Resources depend on the registry (fixed for the pod's lifetime): one-hour cache.
         Ok(
             ListResourcesResult::with_all_items(catalog::list_resources(&self.state))
                 .with_ttl_ms(3_600_000)
@@ -521,7 +519,7 @@ impl ServerHandler for Gateway {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
         let contents = catalog::read(&self.state, &request.uri).await?;
-        // L'état des serveurs change : pas de cache (ttl 0).
+        // Server status changes: no cache (ttl 0).
         let mut result = ReadResourceResult::new(vec![contents]);
         result.ttl_ms = Some(0);
         result.cache_scope = Some(CacheScope::Public);

@@ -1,10 +1,10 @@
-//! Garde-fous contre la dérive du guide de déploiement (`guide-ssp.md`) par rapport au
-//! registre réel (`registry.yaml`). Voir `src/guide.rs`.
+//! Guards against drift of the deployment guide (`guide-ssp.md`) relative to the real
+//! registry (`registry.yaml`). See `src/guide.rs`.
 //!
-//! - `deployment_guide_cites_only_enabled_servers` : hermétique (aucun réseau) ;
-//! - `cited_tools_still_exist_upstream` : interroge les vrais amonts, donc ignoré par
-//!   défaut ; à lancer avec `cargo test --test guide_drift -- --ignored`. Un amont
-//!   injoignable est sauté (avec un message), pas compté comme un échec.
+//! - `deployment_guide_cites_only_enabled_servers`: hermetic (no network);
+//! - `cited_tools_still_exist_upstream`: queries the real upstreams, so ignored by
+//!   default; run it with `cargo test --test guide_drift -- --ignored`. An unreachable
+//!   upstream is skipped (with a message), not counted as a failure.
 
 use std::path::Path;
 
@@ -26,23 +26,23 @@ fn deployment_guide(config: &Config) -> String {
         .guide_path
         .as_ref()
         .expect("guide_path");
-    std::fs::read_to_string(path).expect("guide de déploiement")
+    std::fs::read_to_string(path).expect("deployment guide")
 }
 
 #[test]
-#[ignore = "registry.yaml incomplet : renseigner les URL de insee, melodi, rmes et geodata cités par guide-ssp.md"]
+#[ignore = "registry.yaml incomplete: fill in the URLs of insee, melodi, rmes and geodata cited by guide-ssp.md"]
 fn deployment_guide_cites_only_enabled_servers() {
     let config = registry();
     let problems = guide::check_against_registry(&deployment_guide(&config), &config);
     assert!(
         problems.is_empty(),
-        "le guide de déploiement a dérivé :\n{}",
+        "the deployment guide has drifted:\n{}",
         problems.join("\n")
     );
 }
 
 #[tokio::test]
-#[ignore = "réseau : interroge les serveurs amont réels"]
+#[ignore = "network: queries the real upstream servers"]
 async fn cited_tools_still_exist_upstream() {
     let config = registry();
     let cited = guide::cited_upstream_tools(&deployment_guide(&config), &config);
@@ -58,7 +58,7 @@ async fn cited_tools_still_exist_upstream() {
         let inventory = match upstream.fetch_tools().await {
             Ok(inventory) => inventory,
             Err(e) => {
-                eprintln!("amont '{server}' injoignable, vérification sautée : {e}");
+                eprintln!("upstream '{server}' unreachable, check skipped: {e}");
                 continue;
             }
         };
@@ -70,6 +70,6 @@ async fn cited_tools_still_exist_upstream() {
     }
     assert!(
         missing.is_empty(),
-        "outils cités mais absents des amonts : {missing:?}"
+        "tools cited but missing from the upstreams: {missing:?}"
     );
 }
