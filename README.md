@@ -1,8 +1,6 @@
-<center>
-
-![](docs/assets/MCPortal_logo.png)
-
-</center>
+<p align="center">
+  <img src="docs/assets/MCPortal_logo.png" alt="MCPortal logo" width="200">
+</p>
 
 Ce Portail MCP agrège plusieurs serveurs MCP déclarés dans un
 registre YAML et les expose à un client MCP (Claude, Claude Code…) sous la forme d'**un
