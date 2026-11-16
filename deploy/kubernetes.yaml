@@ -9,7 +9,11 @@ metadata:
   name: mcportal-config
 data:
   registry.yaml: |
-    # Content of registry.yaml (guide_path: guide-ssp.md, relative to this file)
+    # Content of registry.yaml (guide_path: guide-ssp.md, relative to this file), with
+    # `gateway.http` overridden: registry.yaml binds to 127.0.0.1 for local runs, which would
+    # make the pod unreachable. allowed_hosts stays empty: the Ingress below filters on host.
+    #   gateway:
+    #     http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
   guide-ssp.md: |
     # Content of guide-ssp.md
 ---
@@ -64,3 +68,19 @@ spec:
   ports:
     - {name: mcp, port: 80, targetPort: mcp}
     - {name: metrics, port: 9090, targetPort: metrics}   # do not expose through the ingress
+---
+# Only /mcp is exposed. /health (detailed status, upstream errors with internal URLs) and
+# /ready stay reachable by the kubelet probes only; /metrics is on another port.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcportal
+spec:
+  rules:
+    - host: mcportal.example.org          # to adapt
+      http:
+        paths:
+          - path: /mcp
+            pathType: Exact
+            backend:
+              service: {name: mcportal, port: {name: mcp}}

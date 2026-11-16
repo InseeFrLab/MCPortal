@@ -47,7 +47,7 @@ cargo run -- --config registry.yaml
 
 | Port | Routes |
 | --- | --- |
-| 8000 | `/mcp` (MCP endpoint), `/health`, `/ready` |
+| 8000 | `/mcp` (MCP endpoint), `/health`, `/ready` (only `/mcp` goes through the ingress) |
 | 9090 | `/metrics` (Prometheus) |
 
 To plug the gateway into Claude Code:
@@ -69,7 +69,8 @@ gateway:
   health: {enabled: true, path: /health, probe_interval_seconds: 60, failure_threshold: 2}
   metrics: {log_level: INFO, json_logs: true, prometheus: {enabled: true, port: 9090}}
   concurrency: {acquire_timeout_seconds: 5}
-  http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
+  # Local: loopback only + Host check. In Kubernetes: bind "0.0.0.0:8000" (see deploy/).
+  http: {bind: "127.0.0.1:8000", path: /mcp, allowed_hosts: [localhost, 127.0.0.1, "::1"]}
 
 servers:
   - name: mcpdiffusion            # unique name, also used as the tool prefix: [A-Za-z0-9-],

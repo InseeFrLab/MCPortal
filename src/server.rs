@@ -4,7 +4,7 @@
 //!
 //! | Port | Routes | Exposed |
 //! | --- | --- | --- |
-//! | `gateway.http.bind` (8000) | `/mcp` (MCP Streamable HTTP), `/health`, `/ready` | through the ingress |
+//! | `gateway.http.bind` (8000) | `/mcp` (MCP Streamable HTTP), `/health`, `/ready` | only `/mcp` through the ingress |
 //! | `metrics.prometheus.port` (9090) | `/metrics` | cluster-internal |
 //!
 //! ## Stateless mode
@@ -16,8 +16,10 @@
 //! ## Kubernetes probes
 //!
 //! - `/health` (liveness): 200 as long as the process responds. The JSON body details the
-//!   upstreams' status, but a failing upstream **does not** fail the probe (otherwise
-//!   Kubernetes would restart the gateway for an outage that is not its own).
+//!   upstreams' status (including `last_error`, which may contain internal URLs: keep it
+//!   cluster-internal, the ingress must only route `/mcp`), but a failing upstream **does
+//!   not** fail the probe (otherwise Kubernetes would restart the gateway for an outage that
+//!   is not its own).
 //! - `/ready` (readiness): 200 once the first tool load is done, 503 before that and during
 //!   shutdown.
 //!

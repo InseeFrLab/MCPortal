@@ -380,13 +380,16 @@ impl Default for ConcurrencyConfig {
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     /// Listening address of the MCP port (and of /health, /ready).
+    /// Defaults to loopback (`127.0.0.1:8000`) so that a local `cargo run` is not reachable
+    /// from the network; set `0.0.0.0:8000` explicitly in a container.
     #[serde(default = "default_bind")]
     pub bind: String,
     /// Path of the MCP endpoint (Streamable HTTP).
     #[serde(default = "default_mcp_path")]
     pub path: String,
     /// Allowed values for the `Host` header (DNS rebinding protection).
-    /// Empty = accept everything, which suits running behind a Kubernetes ingress.
+    /// Empty = accept everything: only acceptable behind a Kubernetes ingress that already
+    /// routes on the host. Locally, list `localhost`, `127.0.0.1`, `::1`.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
 }
@@ -510,7 +513,7 @@ fn default_acquire_timeout() -> f64 {
     5.0
 }
 fn default_bind() -> String {
-    "0.0.0.0:8000".into()
+    "127.0.0.1:8000".into()
 }
 fn default_mcp_path() -> String {
     "/mcp".into()

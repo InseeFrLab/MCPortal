@@ -11,7 +11,9 @@ gateway:
   health: {enabled: true, path: /health, probe_interval_seconds: 60, failure_threshold: 2}
   metrics: {log_level: INFO, json_logs: true, prometheus: {enabled: true, port: 9090}}
   concurrency: {acquire_timeout_seconds: 5}
-  http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
+  # Local default: loopback only, and Host header restricted (DNS rebinding protection).
+  # In Kubernetes, the ConfigMap overrides this with bind 0.0.0.0:8000 (see deploy/kubernetes.yaml).
+  http: {bind: "127.0.0.1:8000", path: /mcp, allowed_hosts: [localhost, 127.0.0.1, "::1"]}
 
 servers:
   - name: mcpdiffusion                        # also used as the tool prefix
