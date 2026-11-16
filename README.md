@@ -96,9 +96,17 @@ The `RUST_LOG` variable takes precedence over `log_level` (e.g. `RUST_LOG=mcport
 
 ## Deployment
 
+The image is published on GHCR by CI (`.github/workflows/docker.yml`):
+
 ```bash
+docker pull ghcr.io/inseefrlab/mcportal:0.1.0   # or :latest
+# local build:
 docker build -t mcportal:0.1.0 .
 ```
+
+To release: bump `version` in `Cargo.toml`, then push a matching tag
+(`git tag v0.1.0 && git push origin v0.1.0`). CI runs the tests, pushes the
+`X.Y.Z`, `X.Y` and `latest` tags and creates the GitHub Release.
 
 A Kubernetes example (ConfigMap, Deployment, Service) is provided in
 [`deploy/kubernetes.yaml`](deploy/kubernetes.yaml). Key points:

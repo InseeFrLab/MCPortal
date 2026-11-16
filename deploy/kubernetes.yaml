@@ -30,7 +30,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
         - name: mcportal
-          image: mcportal:0.1.0
+          image: ghcr.io/inseefrlab/mcportal:0.1.0
           ports:
             - {name: mcp, containerPort: 8000}
             - {name: metrics, containerPort: 9090}
