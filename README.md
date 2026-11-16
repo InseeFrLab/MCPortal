@@ -72,7 +72,8 @@ gateway:
   http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
 
 servers:
-  - name: mcpdiffusion            # unique name, also used as the tool prefix
+  - name: mcpdiffusion            # unique name, also used as the tool prefix: [A-Za-z0-9-],
+                                  # no '_'; search, call and send are reserved
     url: https://mcpdiffusion.lab.sspcloud.fr/mcp
     transport: http               # http (sse: deprecated, not supported)
     domain: diffusion

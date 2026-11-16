@@ -28,7 +28,9 @@ Périmètre : tout `src/`. Clippy ne remonte aucun avertissement et les tests pa
 
 **Correctif** : passer l'`Arc<Connection>` utilisé à `invalidate` et ne retirer la connexion que si `Arc::ptr_eq(current, used)`.
 
-### 3. Des noms de tools choisis par le client deviennent des labels Prometheus (`gateway.rs:287`, `402`)
+### 3. ✅ Corrigé : des noms de tools choisis par le client deviennent des labels Prometheus (`gateway.rs:287`, `402`)
+
+> **Résolution** : pour un nom absent du catalogue, la métrique est comptée avec `server="unknown"` et `tool="unknown"`. Le nom demandé, tronqué à 128 caractères, n'apparaît que dans le log (`requested_tool`). La même branche ne renvoie plus non plus au LLM un nom de taille illimitée.
 
 Pour un tool inconnu, `record_call("unknown", name, "invalid", …)` met le `name` fourni par le client (souvent un nom halluciné par le LLM, sans limite de taille ni de variété) dans le label `tool` de `mcportal_tool_calls_total`. L'endpoint étant public et non authentifié, n'importe qui peut créer des séries à volonté. Cela contredit le principe d'ARCHITECTURE.md, qui veut éviter l'explosion de cardinalité.
 

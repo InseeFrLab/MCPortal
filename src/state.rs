@@ -152,9 +152,10 @@ impl AppState {
             server_texts.insert(upstream.name().to_owned(), server_text(upstream));
             for tool in upstream_tools.iter() {
                 let name = exposed_name(upstream.name(), &tool.name);
-                // Possible collision: server "a_b" + tool "c" and server "a" + tool "b_c".
+                // Cannot happen: server names are unique and contain no '_' (see
+                // `Config::validate`), so `{server}_{tool}` is unique. Kept as a safeguard.
                 if tools.contains_key(&name) {
-                    tracing::warn!(tool = %name, server = upstream.name(), "duplicate exposed tool name, ignored");
+                    tracing::error!(tool = %name, server = upstream.name(), "duplicate exposed tool name, ignored");
                     continue;
                 }
                 let mut exposed = tool.clone();

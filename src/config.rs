@@ -130,14 +130,29 @@ impl Config {
         for s in &self.servers {
             // The name is used as the tool prefix ("{server}_{tool}"): restrict it to characters
             // that are safe in an MCP tool name and in a catalog://servers/{name} URI.
+            //
+            // No '_': the first '_' of an exposed name then always separates the server from
+            // the tool, so two (server, tool) pairs can never produce the same exposed name
+            // (with '_' allowed, "a_b" + "c" and "a" + "b_c" would both give "a_b_c").
             let valid_name = !s.name.is_empty()
                 && s.name
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-');
             if !valid_name {
                 return invalid(format!(
-                    "invalid server name '{}': only [A-Za-z0-9_-]",
+                    "invalid server name '{}': only [A-Za-z0-9-] (no '_', which separates \
+                     the server from the tool in exposed names)",
                     s.name
+                ));
+            }
+            // A server named "send" with a tool "feedback" would be exposed as
+            // "send_feedback" and shadowed by the gateway's own tool.
+            if reserved_server_names().any(|reserved| reserved == s.name) {
+                return invalid(format!(
+                    "reserved server name '{}': its tools would collide with the gateway's \
+                     own tools ({})",
+                    s.name,
+                    crate::guide::GATEWAY_TOOLS.join(", ")
                 ));
             }
             if !seen.insert(s.name.as_str()) {
@@ -172,6 +187,14 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Server names whose tools could collide with the gateway's own tools: the part before the
+/// first `_` of each of them (`search`, `call`, `send`).
+fn reserved_server_names() -> impl Iterator<Item = &'static str> {
+    crate::guide::GATEWAY_TOOLS
+        .iter()
+        .filter_map(|tool| tool.split_once('_').map(|(server, _)| server))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -576,6 +599,27 @@ servers:
     fn rejects_invalid_prefix_characters() {
         let yaml = "gateway: {name: T}\nservers:\n  - {name: 'a b', url: http://x/mcp}\n";
         assert!(Config::from_yaml(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_underscore_in_server_names() {
+        // "a_b" + tool "c" and "a" + tool "b_c" would both be exposed as "a_b_c".
+        let yaml = "gateway: {name: T}\nservers:\n  - {name: a_b, url: http://x/mcp}\n";
+        let err = Config::from_yaml(yaml).unwrap_err().to_string();
+        assert!(err.contains("no '_'"), "{err}");
+        let yaml = "gateway: {name: T}\nservers:\n  - {name: geo-data, url: http://x/mcp}\n";
+        assert!(Config::from_yaml(yaml).is_ok());
+    }
+
+    #[test]
+    fn rejects_names_colliding_with_gateway_tools() {
+        for name in ["search", "call", "send"] {
+            let yaml = format!(
+                "gateway: {{name: T}}\nservers:\n  - {{name: {name}, url: http://x/mcp}}\n"
+            );
+            let err = Config::from_yaml(&yaml).unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{name}: {err}");
+        }
     }
 
     #[test]

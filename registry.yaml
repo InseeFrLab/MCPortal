@@ -3,7 +3,11 @@
 gateway:
   name: SSP Gateway
   tool_search: {enabled: true, max_results: 5}
-  catalog: {enabled: true, include_tool_inventory: true, include_guide: true, guide_path: guide-ssp.md}
+  # guide_path: guide-ssp.md is NOT enabled yet: that guide cites the insee, melodi, rmes and
+  # geodata servers, which are not declared below (URLs to fill in). Served as is, it would
+  # send the LLM to tools that do not exist. Add `guide_path: guide-ssp.md` back once those
+  # servers are declared: the guide_drift test and a startup warning check the consistency.
+  catalog: {enabled: true, include_tool_inventory: true, include_guide: true}
   health: {enabled: true, path: /health, probe_interval_seconds: 60, failure_threshold: 2}
   metrics: {log_level: INFO, json_logs: true, prometheus: {enabled: true, port: 9090}}
   concurrency: {acquire_timeout_seconds: 5}
