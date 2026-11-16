@@ -1,7 +1,7 @@
 //! Guards against drift of the deployment guide (`guide-ssp.md`) relative to the real
 //! registry (`registry.yaml`). See `src/guide.rs`.
 //!
-//! - `deployment_guide_cites_only_enabled_servers`: hermetic (no network);
+//! - `deployment_guide_cites_only_enabled_servers`: hermetic (no network), always run;
 //! - `cited_tools_still_exist_upstream`: queries the real upstreams, so ignored by
 //!   default; run it with `cargo test --test guide_drift -- --ignored`. An unreachable
 //!   upstream is skipped (with a message), not counted as a failure.
@@ -19,21 +19,21 @@ fn registry() -> Config {
     .expect("registry.yaml")
 }
 
-fn deployment_guide(config: &Config) -> String {
-    let path = config
-        .gateway
-        .catalog
-        .guide_path
-        .as_ref()
-        .expect("guide_path");
-    std::fs::read_to_string(path).expect("deployment guide")
+/// The deployment guide served by `registry.yaml`, if it references one.
+fn deployment_guide(config: &Config) -> Option<String> {
+    let path = config.gateway.catalog.guide_path.as_ref()?;
+    Some(std::fs::read_to_string(path).expect("deployment guide"))
 }
 
+/// Not ignored: as soon as `registry.yaml` references a guide, it must match the registry.
+/// This prevents serving `guide-ssp.md` before its servers are declared.
 #[test]
-#[ignore = "registry.yaml incomplete: fill in the URLs of insee, melodi, rmes and geodata cited by guide-ssp.md"]
 fn deployment_guide_cites_only_enabled_servers() {
     let config = registry();
-    let problems = guide::check_against_registry(&deployment_guide(&config), &config);
+    let Some(text) = deployment_guide(&config) else {
+        return; // no deployment guide served: nothing can drift
+    };
+    let problems = guide::check_against_registry(&text, &config);
     assert!(
         problems.is_empty(),
         "the deployment guide has drifted:\n{}",
@@ -45,7 +45,10 @@ fn deployment_guide_cites_only_enabled_servers() {
 #[ignore = "network: queries the real upstream servers"]
 async fn cited_tools_still_exist_upstream() {
     let config = registry();
-    let cited = guide::cited_upstream_tools(&deployment_guide(&config), &config);
+    let Some(text) = deployment_guide(&config) else {
+        return;
+    };
+    let cited = guide::cited_upstream_tools(&text, &config);
     let mut missing = Vec::new();
     for (server, tools) in cited {
         let upstream_config = config

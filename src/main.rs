@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use mcportal::{config::Config, server, state::AppState, telemetry};
+use mcportal::{config::Config, guide, server, state::AppState, telemetry};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         Config::load(&args.config).with_context(|| format!("loading {}", args.config.display()))?;
 
     telemetry::init_logging(&config.gateway.metrics);
+    warn_on_guide_drift(&config);
     let prometheus = telemetry::install_prometheus(&config.gateway.metrics)?;
 
     let listener = TcpListener::bind(&config.gateway.http.bind)
@@ -65,4 +66,26 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     server::serve(state, listener, metrics, stop).await
+}
+
+/// Warns (without blocking startup) if the deployment guide cites servers that the registry
+/// does not declare or has disabled: the guide would send the LLM to tools that do not exist.
+/// Not fatal on purpose: disabling a server (`enabled: false`) must not prevent the pod from
+/// starting.
+fn warn_on_guide_drift(config: &Config) {
+    let catalog = &config.gateway.catalog;
+    let Some(path) = catalog
+        .guide_path
+        .as_ref()
+        .filter(|_| catalog.enabled && catalog.include_guide)
+    else {
+        return;
+    };
+    // Existence already checked by `Config::load`; the file is re-read on each resource read.
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for problem in guide::check_against_registry(&text, config) {
+        tracing::warn!(guide = %path.display(), problem, "deployment guide inconsistent with the registry");
+    }
 }
