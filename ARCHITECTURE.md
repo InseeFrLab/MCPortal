@@ -274,11 +274,18 @@ traffic with an empty catalog during a rolling update.
 | `mcportal_feedback_total` | counter | server |
 
 `status` values: `ok`, `tool_error`, `upstream_error`, `timeout`, `rejected`, `invalid`,
-`cancelled`. No metric carries a user identifier, to avoid a cardinality explosion.
+`cancelled`. No metric carries a user identifier or a value chosen by the client, to avoid
+a cardinality explosion: a call to a name missing from the catalog is counted with
+`server="unknown"` and `tool="unknown"`, and the requested name (truncated to 128
+characters) only appears in the log (`requested_tool`).
 
 Each relayed call produces a `"message": "tool call"` log with `server`, `tool`, `status`,
 `duration_ms` and `upstream_ms`. Feedback from `send_feedback` carries
 `"label": "FEEDBACK"`.
+
+The endpoint is public and unauthenticated, so free text is capped: `search_tools.query`
+at 500 characters, `send_feedback.author` at 200 and `send_feedback.feedback` at 4000. A
+longer value is rejected with a tool error that tells the LLM to shorten it.
 
 ## Testing strategy
 

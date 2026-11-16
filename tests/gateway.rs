@@ -375,6 +375,35 @@ async fn send_feedback_validates_server_name() {
 }
 
 #[tokio::test]
+async fn oversized_free_text_is_rejected() {
+    let ct = CancellationToken::new();
+    let up = spawn_upstream(&ct).await;
+    let gw = spawn_gateway(config(&[("mock", &up)], "", "")).await;
+    let client = connect(&gw.url).await;
+
+    let feedback = "x".repeat(mcportal::gateway::MAX_FEEDBACK_CHARS + 1);
+    let ko = call(
+        &client,
+        "send_feedback",
+        json!({"server": "mock", "author": "test", "feedback": feedback}),
+    )
+    .await;
+    assert!(is_error(&ko));
+    assert!(text(&ko).contains("too long"), "{}", text(&ko));
+
+    let query = "x".repeat(mcportal::gateway::MAX_QUERY_CHARS + 1);
+    let ko = call(&client, "search_tools", json!({"query": query})).await;
+    assert!(is_error(&ko));
+
+    // An unknown name is echoed truncated, not as received.
+    let name = format!("mock_{}", "y".repeat(10_000));
+    let ko = call_via_gateway(&client, &name, json!({})).await;
+    assert!(is_error(&ko));
+    assert!(text(&ko).len() < 1_000, "{} bytes echoed", text(&ko).len());
+    ct.cancel();
+}
+
+#[tokio::test]
 async fn health_ready_and_graceful_shutdown() {
     let ct = CancellationToken::new();
     let up = spawn_upstream(&ct).await;

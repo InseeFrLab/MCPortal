@@ -30,7 +30,9 @@ use crate::config::MetricsConfig;
 
 /// Metric names, grouped here to see the full inventory at a glance.
 pub mod metric {
-    /// counter — labels: server, tool, status (ok | tool_error | upstream_error | timeout | rejected | invalid)
+    /// counter — labels: server, tool, status (ok | tool_error | upstream_error | timeout | rejected | invalid).
+    /// `tool` is always a catalog name, or "unknown" (with `server` "unknown") for a name the
+    /// catalog does not know: never a name chosen by the client.
     pub const TOOL_CALLS: &str = "mcportal_tool_calls_total";
     /// histogram (s) — label: server — total duration seen by the downstream client
     pub const TOOL_CALL_DURATION: &str = "mcportal_tool_call_duration_seconds";

@@ -64,6 +64,16 @@ pub const SEARCH_TOOLS: &str = "search_tools";
 pub const CALL_TOOL: &str = "call_tool";
 pub const SEND_FEEDBACK: &str = "send_feedback";
 
+/// Size caps (in characters) of the free text the gateway accepts. The endpoint is public and
+/// unauthenticated: without them, a single request (up to rmcp's 4 MiB body limit) could
+/// write megabytes into the logs or run a search over a huge query.
+pub const MAX_QUERY_CHARS: usize = 500;
+pub const MAX_AUTHOR_CHARS: usize = 200;
+pub const MAX_FEEDBACK_CHARS: usize = 4000;
+/// Unknown names chosen by the client are cut to this length before being echoed in an
+/// error, logged or searched.
+const MAX_ECHOED_NAME_CHARS: usize = 128;
+
 // ---------------------------------------------------------------------------------------------
 // Arguments of the gateway's tools
 // ---------------------------------------------------------------------------------------------
@@ -75,7 +85,8 @@ pub const SEND_FEEDBACK: &str = "send_feedback";
 #[serde(deny_unknown_fields)]
 pub struct SearchToolsArgs {
     /// Keywords describing what you want to do, preferably in the language of the tool
-    /// descriptions (e.g. "geocode an address", "population datasets").
+    /// descriptions (e.g. "geocode an address", "population datasets"). At most 500
+    /// characters.
     pub query: String,
     /// Maximum number of results (capped by the gateway configuration).
     #[serde(default)]
@@ -99,9 +110,10 @@ pub struct CallToolArgs {
 pub struct SendFeedbackArgs {
     /// Name of the server concerned (a registry server, see catalog://servers).
     pub server: String,
-    /// Author of the feedback (name, identifier or role).
+    /// Author of the feedback (name, identifier or role). At most 200 characters.
     pub author: String,
-    /// The feedback: problem encountered, unexpected behavior, suggestion…
+    /// The feedback: problem encountered, unexpected behavior, suggestion… At most 4000
+    /// characters.
     pub feedback: String,
 }
 
@@ -195,6 +207,9 @@ impl Gateway {
     // --- search_tools ---------------------------------------------------------------------
 
     fn search_tools(&self, args: SearchToolsArgs) -> CallToolResult {
+        if let Some(error) = too_long("query", &args.query, MAX_QUERY_CHARS) {
+            return error;
+        }
         metrics::counter!(metric::SEARCH_QUERIES).increment(1);
         let max = self.state.config.gateway.tool_search.max_results;
         let limit = args.limit.unwrap_or(max).clamp(1, max);
@@ -237,9 +252,14 @@ impl Gateway {
             let known: Vec<&str> = self.state.upstreams.keys().map(String::as_str).collect();
             return tool_error(format!(
                 "unknown server '{}'. Registry servers: {}",
-                args.server,
+                truncate(&args.server, MAX_ECHOED_NAME_CHARS),
                 known.join(", ")
             ));
+        }
+        if let Some(error) = too_long("author", &args.author, MAX_AUTHOR_CHARS)
+            .or_else(|| too_long("feedback", &args.feedback, MAX_FEEDBACK_CHARS))
+        {
+            return error;
         }
         // The FEEDBACK label makes it possible to filter these lines in Loki/Grafana.
         tracing::info!(
@@ -270,6 +290,9 @@ impl Gateway {
         // 1-2. Resolve the name in the current catalog.
         let catalog = self.state.catalog.load();
         let Some(entry) = catalog.tools.get(name) else {
+            // `name` comes from the client (often a name made up by the LLM): cut it before
+            // searching, logging or echoing it.
+            let name = truncate(name, MAX_ECHOED_NAME_CHARS);
             let suggestions: Vec<String> = catalog
                 .index
                 .search(name, 3)
@@ -284,7 +307,11 @@ impl Gateway {
                     suggestions.join(", ")
                 )
             };
-            record_call("unknown", name, "invalid", started, None);
+            // Metric label "unknown", never the requested name: it is chosen by the client of a
+            // public endpoint, so it would let anyone create Prometheus series at will. The
+            // real name only goes to the log.
+            tracing::info!(requested_tool = name, "unknown tool requested");
+            record_call("unknown", UNKNOWN_TOOL, "invalid", started, None);
             return tool_error(format!("unknown tool '{name}'. {hint}")).into();
         };
         let server = entry.server.as_str();
@@ -373,6 +400,26 @@ impl Gateway {
             }
         }
     }
+}
+
+/// Value of the `tool` label (metrics and logs) for a call to a name that is not in the catalog.
+const UNKNOWN_TOOL: &str = "unknown";
+
+/// The first `max` characters of `text` (on a character boundary).
+fn truncate(text: &str, max: usize) -> &str {
+    text.char_indices()
+        .nth(max)
+        .map_or(text, |(end, _)| &text[..end])
+}
+
+/// Tool error if `value` exceeds `max` characters, so the LLM can shorten it and retry.
+fn too_long(field: &str, value: &str, max: usize) -> Option<CallToolResult> {
+    let length = value.chars().count();
+    (length > max).then(|| {
+        tool_error(format!(
+            "`{field}` is too long ({length} characters, at most {max}): shorten it and retry."
+        ))
+    })
 }
 
 /// Error result readable by the LLM (`isError: true`).
@@ -524,5 +571,25 @@ impl ServerHandler for Gateway {
         result.ttl_ms = Some(0);
         result.cache_scope = Some(CacheScope::Public);
         Ok(result.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_cuts_on_character_boundaries() {
+        assert_eq!(truncate("abc", 5), "abc");
+        assert_eq!(truncate("abcdef", 3), "abc");
+        // Multi-byte characters: never cut in the middle of one.
+        assert_eq!(truncate("éééé", 2), "éé");
+    }
+
+    #[test]
+    fn too_long_counts_characters_not_bytes() {
+        assert!(too_long("f", &"é".repeat(10), 10).is_none());
+        let error = too_long("f", &"a".repeat(11), 10).expect("too long");
+        assert_eq!(error.is_error, Some(true));
     }
 }
