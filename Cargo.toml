@@ -28,7 +28,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["async_tokio"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 
 [[bench]]
 name = "overhead"
