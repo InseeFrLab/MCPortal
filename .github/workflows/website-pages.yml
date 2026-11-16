@@ -5,7 +5,7 @@ name: Deploy website
 
 on:
   push:
-    branches: [main, mvp_mcportal]
+    branches: [main]
     paths:
       - 'website/**'
       - '.github/workflows/website-pages.yml'

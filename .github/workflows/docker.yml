@@ -9,7 +9,7 @@ name: Build and release Docker image
 
 on:
   push:
-    branches: [main, mvp_mcportal]
+    branches: [main]
     tags: ['v*.*.*']
     paths-ignore:
       - 'website/**'
