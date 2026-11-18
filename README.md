@@ -2,6 +2,16 @@
   <img src="docs/assets/MCPortal_logo.png" alt="MCPortal logo" width="200">
 </p>
 
+
+<p align="center">
+  <a href="https://mcportal.lab.sspcloud.fr/mcp"> Démo with INSEE & IGN data </a>
+</p>
+
+
+> [!WARNING]
+> **This project is currently in beta and under active development.**
+> Features may change, and some things may break. Feedback and contributions are welcome!
+
 MCPortal aggregates several MCP servers declared in a YAML registry and exposes them to an
 MCP client (Claude, Claude Code…) as **a single server**.
 
