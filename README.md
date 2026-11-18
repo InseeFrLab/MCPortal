@@ -2,6 +2,16 @@
   <img src="docs/assets/MCPortal_logo.png" alt="MCPortal logo" width="200">
 </p>
 
+
+<p align="center">
+  <a href="https://mcportal.lab.sspcloud.fr/mcp"> Démo with INSEE & IGN data </a>
+</p>
+
+
+> [!WARNING]
+> **This project is currently in beta and under active development.**
+> Features may change, and some things may break. Feedback and contributions are welcome!
+
 MCPortal aggregates several MCP servers declared in a YAML registry and exposes them to an
 MCP client (Claude, Claude Code…) as **a single server**.
 
@@ -84,6 +94,26 @@ servers:
     timeout: 30.0                 # timeout per upstream call (s)
     max_concurrency: 4            # concurrent calls to this server
     cache_ttl: 300                # lifetime of the tool list cache (s)
+  - name: geodata
+    url: https://geollm.beta.ign.fr/geocontext/mcp
+    transport: http
+    domain: geographie
+    description: Données géographiques de l'IGN
+    tags: [carte]
+    enabled: true
+    timeout: 45.0
+    max_concurrency: 8
+    cache_ttl: 600
+  - name: sirene
+    url: https://mcpsirene.lab.sspcloud.fr/mcp
+    transport: http
+    domain: diffusion
+    description: Données du répertoire d'entreprises sirene
+    tags: [sirene]
+    enabled: true
+    timeout: 45.0
+    max_concurrency: 8
+    cache_ttl: 600
 ```
 
 Every key has a default value; they are all documented in
