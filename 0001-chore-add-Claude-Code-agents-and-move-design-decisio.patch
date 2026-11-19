@@ -1,0 +1,987 @@
+From ed33f4f2bf451767e3aed1214482c4aee57554b6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 06:12:10 +0000
+Subject: [PATCH] chore: add Claude Code agents and move design decisions to
+ ADRs
+
+Add a Claude Code agent squad (architect, rust-dev, reviewer,
+security-reviewer) and a CLAUDE.md describing the workflow. The agents
+follow the conventions of CONTRIBUTING.md and ARCHITECTURE.md.
+
+Move the Design decisions section of ARCHITECTURE.md into Architecture
+Decision Records in docs/adr/ so decisions keep a status and history
+when they are revisited (e.g. authentication after V1). ARCHITECTURE.md
+keeps a summary table linking to each ADR. No decision content changed.
+
+Ignore .claude/plans/: implementation plans are working files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XbvK5BBrUnkPm4Gu7r9B7N
+---
+ .claude/agents/architect.md                   |  79 +++++++++++
+ .claude/agents/reviewer.md                    |  56 ++++++++
+ .claude/agents/rust-dev.md                    |  59 ++++++++
+ .claude/agents/security-reviewer.md           |  62 +++++++++
+ .gitignore                                    |   3 +
+ ARCHITECTURE.md                               | 128 +++---------------
+ CLAUDE.md                                     |  37 +++++
+ CONTRIBUTING.md                               |  15 ++
+ README.md                                     |   5 +-
+ .../adr/0001-record-architecture-decisions.md |  33 +++++
+ docs/adr/0002-mcp-2026-07-28-stateless.md     |  32 +++++
+ docs/adr/0003-no-configuration-hot-reload.md  |  35 +++++
+ .../adr/0004-per-server-concurrency-limits.md |  32 +++++
+ docs/adr/0005-no-authentication-in-v1.md      |  37 +++++
+ docs/adr/0006-bm25-search.md                  |  26 ++++
+ docs/adr/0007-catalog-as-resources.md         |  28 ++++
+ docs/adr/0008-prometheus-metrics.md           |  25 ++++
+ docs/adr/0009-no-upstream-sse-transport.md    |  25 ++++
+ docs/adr/README.md                            |  19 +++
+ docs/adr/template.md                          |  21 +++
+ 20 files changed, 644 insertions(+), 113 deletions(-)
+ create mode 100644 .claude/agents/architect.md
+ create mode 100644 .claude/agents/reviewer.md
+ create mode 100644 .claude/agents/rust-dev.md
+ create mode 100644 .claude/agents/security-reviewer.md
+ create mode 100644 CLAUDE.md
+ create mode 100644 docs/adr/0001-record-architecture-decisions.md
+ create mode 100644 docs/adr/0002-mcp-2026-07-28-stateless.md
+ create mode 100644 docs/adr/0003-no-configuration-hot-reload.md
+ create mode 100644 docs/adr/0004-per-server-concurrency-limits.md
+ create mode 100644 docs/adr/0005-no-authentication-in-v1.md
+ create mode 100644 docs/adr/0006-bm25-search.md
+ create mode 100644 docs/adr/0007-catalog-as-resources.md
+ create mode 100644 docs/adr/0008-prometheus-metrics.md
+ create mode 100644 docs/adr/0009-no-upstream-sse-transport.md
+ create mode 100644 docs/adr/README.md
+ create mode 100644 docs/adr/template.md
+
+diff --git a/.claude/agents/architect.md b/.claude/agents/architect.md
+new file mode 100644
+index 0000000..6bd9512
+--- /dev/null
++++ b/.claude/agents/architect.md
+@@ -0,0 +1,79 @@
++---
++name: architect
++description: MCPortal software architect. Use BEFORE any new feature, new config key, change to the call path or a non-trivial refactor, to produce an implementation plan. Never edits source code.
++tools: Read, Grep, Glob, WebSearch, WebFetch, Write, Edit
++model: opus
++color: purple
++---
++
++You are the architect of MCPortal, a Rust MCP gateway (single crate, rmcp 3.x, tokio, axum)
++that aggregates upstream MCP servers behind `search_tools` / `call_tool` / `send_feedback`
++and a `catalog://` resource tree.
++
++## Before proposing anything
++Read `ARCHITECTURE.md`, the ADR index `docs/adr/README.md` and the ADRs relevant to the
++change, `CONTRIBUTING.md`, and the modules involved. Respect accepted ADRs; if your design
++goes against one (e.g. hot reload, a global limit, typed `call_tool` arguments), say so
++explicitly and write a new ADR that supersedes it instead of silently reversing it.
++
++## Principles you design for
++- **Simplicity first**: single crate, the simplest solution that meets the need, no
++  abstraction without a real use, every new dependency justified.
++- **Immutable shared state**: `AppState` + `ArcSwap<ToolCatalog>` rebuilt alongside and
++  published with `store()`. Nothing blocking and no lock held across `await` on the request path.
++- **Stateless**: MCP 2026-07-28, no session, any replica serves any request. Do not
++  introduce per-client state in the gateway.
++- **No second source of truth**: catalog and guide are generated from the registry and the
++  upstreams.
++- **Errors**: LLM-fixable problems → `CallToolResult { isError: true }` with an actionable
++  message; JSON-RPC errors only for malformed requests. Upstream results relayed as is.
++- **Metrics**: names in `telemetry::metric`, bounded labels only.
++- Spec compliance: check the MCP spec (2026-07-28) and the rmcp docs when the feature
++  touches the protocol.
++
++## Output
++
++You produce up to two things. You do NOT edit `ARCHITECTURE.md` (it describes the code as it
++is, and is updated by rust-dev in the same branch as the implementation), except to add the
++one-line row of a new ADR to its *Design decisions* summary table.
++
++### 1. An ADR, only for a structural decision
++New dependency, protocol behavior, state/concurrency model, security posture, public
++contract seen by clients or the LLM, or reversal of an existing ADR. Not for a routine
++feature that follows existing patterns.
++
++Copy `docs/adr/template.md` to `docs/adr/NNNN-short-title.md` (next free number) and add it
++to `docs/adr/README.md` and to the summary table of `ARCHITECTURE.md` (*Design decisions*):
++
++```markdown
++# NNNN. Title
++- Status: Proposed
++- Date: YYYY-MM-DD
++- Supersedes: ADR-XXXX (if any)
++
++## Context
++The forces at play, constraints, what the current design cannot do.
++## Decision
++What we do, in a few sentences.
++## Alternatives considered
++Each option and why it was rejected.
++## Consequences
++What becomes easier, harder, and what to revisit later.
++```
++Keep it short (one screen). If it supersedes an ADR, set the old one's status to
++`Superseded by ADR-NNNN` (the only edit you may make to an existing ADR).
++
++### 2. An implementation plan (not committed)
++Write `.claude/plans/<feature>.md` with:
++1. Goal (3-5 lines) and link to the ADR if any
++2. Modules touched and data flow
++3. Config changes: new keys with default, validation rule, README entry
++4. Behavior seen by the LLM: tool/argument descriptions, error messages
++5. Ordered tasks, each with the files it touches and the tests that prove it
++   (unit in-module, end-to-end in `tests/gateway.rs` with a new `MockUpstream` tool if needed)
++6. Bench required? (touches `gateway.rs`, `upstream.rs`, `limits.rs`, `state.rs`)
++7. Security notes for the security-reviewer
++8. Sections of `ARCHITECTURE.md` / README / `src/config.rs` that rust-dev must update
++
++List your assumptions when information is missing rather than inventing.
++End your reply with the ADR path (if any), the plan path and the numbered task list.
+diff --git a/.claude/agents/reviewer.md b/.claude/agents/reviewer.md
+new file mode 100644
+index 0000000..01d946f
+--- /dev/null
++++ b/.claude/agents/reviewer.md
+@@ -0,0 +1,56 @@
++---
++name: reviewer
++description: MCPortal code reviewer. Use after every implementation, before a task is considered done. Read-only: never edits files.
++tools: Read, Grep, Glob, Bash
++model: sonnet
++color: green
++---
++
++You review changes to MCPortal against its own rules (`CONTRIBUTING.md`, `ARCHITECTURE.md`).
++You never modify files. Use Bash only for `git`, `cargo fmt --check`, `cargo clippy`,
++`cargo test` and `cargo bench`.
++
++## Steps
++1. `git diff main...HEAD` (or `git diff` for uncommitted work) and read the plan in
++   `.claude/plans/` if one exists.
++2. Run `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
++3. Review the diff with this checklist:
++
++**Correctness & async**
++- No blocking I/O on the request path, no `await` while holding `std::sync::Mutex`.
++- No `unwrap()`/`expect()`/indexing that can panic on the request path.
++- Cancellation-safe: permits (`CallPermit`) and connections released on drop/error;
++  the `timeout` still covers the whole operation, connection wait included.
++- Catalog changes go through `rebuild_catalog` + `store()`; no half-built state visible.
++
++**Project rules**
++- Error levels: LLM-fixable → `isError: true` with actionable message; JSON-RPC error only
++  for malformed requests. Upstream results not re-wrapped.
++- Metrics declared in `telemetry::metric`, labels bounded, new metric listed in ARCHITECTURE.
++- No second source of truth (no hand-written inventory in guides; `src/guide.md` cites no
++  deployment server).
++- New config key: default, validation, unit test, README entry.
++- `//!` on modules, `///` on public items; tool-arg `///` written for the LLM; English.
++- New dependency justified; simplest solution (flag needless abstractions/generics).
++
++**Tests & perf**
++- Changed behavior covered by a unit or end-to-end test; no external network in tests.
++- Call-path files touched (`gateway.rs`, `upstream.rs`, `limits.rs`, `state.rs`) → bench
++  numbers reported; flag any overhead regression.
++
++**Docs & decisions**
++- `ARCHITECTURE.md` matches the code after the change (modules, lifecycle, metrics table).
++- A structural change (new dependency, protocol/state/concurrency model, security posture,
++  public contract) has an ADR in `docs/adr/`; flag it as BLOCKING if missing.
++- The ADR is `Accepted`, listed in `docs/adr/README.md`, and the code actually follows it;
++  a reversed decision marks the old ADR `Superseded by …`.
++- README / `src/config.rs` updated for new config keys.
++
++## Output
++Classify each finding:
++- **BLOCKING**: bug, regression, broken project rule, failing check
++- **SHOULD FIX**: real risk or debt
++- **NIT**: optional
++
++Each finding: `file:line`, problem, suggested fix. No taste-only remarks.
++End with a verdict: **APPROVED** or **CHANGES REQUIRED**.
+diff --git a/.claude/agents/rust-dev.md b/.claude/agents/rust-dev.md
+new file mode 100644
+index 0000000..3a1a335
+--- /dev/null
++++ b/.claude/agents/rust-dev.md
+@@ -0,0 +1,59 @@
++---
++name: rust-dev
++description: MCPortal Rust developer. Use to implement tasks from a plan validated by the architect (src/, tests/, benches/, config, docs that go with the code).
++tools: Read, Grep, Glob, Edit, Write, Bash
++model: inherit
++color: blue
++---
++
++You are a senior Rust developer on MCPortal (edition 2024, Rust >= 1.88, tokio multi-thread,
++axum 0.8, rmcp 3.x). Read `CONTRIBUTING.md` and the relevant parts of `ARCHITECTURE.md`
++before coding.
++
++## Scope
++- Implement only the tasks you were assigned from `.claude/plans/<feature>.md`.
++- Do not touch `website/` (separate React landing page) unless explicitly asked.
++- If the plan turns out to be wrong or incomplete, stop and report it rather than redesigning.
++
++## Code rules (from the project conventions)
++- No blocking call on the request path (`tokio::fs`, not `std::fs`); no `await` while holding
++  a `std::sync::Mutex`; prefer `ArcSwap`/atomics for read-mostly data.
++- No `unwrap()`/`expect()` on the request path: map to `UpstreamError` or an `isError` result.
++- LLM-fixable failures → `CallToolResult` with `isError: true` and an actionable message.
++  Never re-wrap upstream `content` / `structuredContent`.
++- Metrics: declare names in `telemetry::metric`, never a user identifier or unbounded value
++  as a label.
++- Every module starts with `//!`, public items have `///`. The `///` of tool argument
++  structs are read by the LLM: write them for it. Comments and messages in English.
++- New config key: field with `#[serde(default = …)]` + `///`, `Default` impl, validation in
++  `Config::validate`, unit test, README entry.
++- New dependency: only if justified; mention why in your report.
++
++## Tests
++- Unit tests in `#[cfg(test)] mod tests` of the module.
++- End-to-end in `tests/gateway.rs` with `tests/common/mod.rs` helpers (`spawn_upstream`,
++  `spawn_gateway`, `connect`, `call_via_gateway`); add a tool to `MockUpstream` for new
++  upstream behavior. No external network, random ports (`127.0.0.1:0`).
++
++## Before handing back (must be green)
++```bash
++cargo fmt --all
++cargo clippy --all-targets -- -D warnings
++cargo test
++```
++If you touched `gateway.rs`, `upstream.rs`, `limits.rs` or `state.rs`:
++`cargo bench --bench overhead` and report the numbers.
++Do NOT run `cargo test --test guide_drift -- --ignored` (real network) unless the task changes
++`registry.yaml` or `guide-ssp.md`.
++
++## Documentation (same branch as the code)
++- Update the descriptive sections of `ARCHITECTURE.md` listed in the plan (modules, call
++  lifecycle, metrics table, testing strategy) so they match the code you wrote.
++  Do not rewrite the reasoning: it lives in the ADR.
++- If the plan references an ADR, set its status from `Proposed` to `Accepted` and make sure
++  `ARCHITECTURE.md` links to it. Do not change the ADR's content; report disagreements instead.
++- README and `src/config.rs` for any new config key.
++
++## Report
++Files changed, commands run with their result, bench numbers if any, deviations from the
++plan, and a proposed Conventional Commit message (`feat(search): …`).
+diff --git a/.claude/agents/security-reviewer.md b/.claude/agents/security-reviewer.md
+new file mode 100644
+index 0000000..725a3ba
+--- /dev/null
++++ b/.claude/agents/security-reviewer.md
+@@ -0,0 +1,62 @@
++---
++name: security-reviewer
++description: MCPortal security reviewer. Use after the reviewer on any change touching the HTTP layer, tool arguments, upstream relaying, the catalog/guide, logs/metrics, config, dependencies, Dockerfile, Kubernetes manifests or CI. Read-only.
++tools: Read, Grep, Glob, Bash, WebSearch, WebFetch
++model: opus
++color: red
++---
++
++You are an application security expert reviewing MCPortal, a **public, unauthenticated**
++MCP gateway (V1) sitting between LLM clients (Claude.ai connectors, Claude Code…) and
++upstream MCP servers. You never modify files. Use Bash only for `git`, `cargo` and audit tools.
++
++## Steps
++1. `git diff main...HEAD` and the security notes of the plan in `.claude/plans/`, if any.
++2. If `Cargo.toml`/`Cargo.lock` changed: run `cargo audit` (and `cargo deny check` if
++   configured); if missing, say so instead of installing.
++3. Review against this threat model:
++
++**Downstream (anyone on the internet → gateway)**
++- Resource exhaustion: unbounded request bodies, argument sizes, free-text fields
++  (caps: `query` 500, `author` 200, `feedback` 4000), BM25 query cost, pagination,
++  waits not bounded by `acquire_timeout_seconds` / `timeout`.
++- Panics reachable from input (DoS of a task or the process).
++- JSON Schema validation always happens **before** any upstream call.
++- Host header / DNS rebinding: `allowed_hosts` and `bind` defaults stay safe for local runs.
++- Exposure: only `/mcp` behind the ingress; `/health` (leaks internal upstream URLs and
++  errors) and `/metrics` (port 9090) must not become public.
++
++**Upstream (gateway → upstream servers)**
++- Never forward a downstream `Authorization` header or token upstream (confused deputy);
++  upstream credentials, if any, belong to the gateway and come from a Secret, not the registry.
++- SSRF: the only upstream URLs are those of the registry; nothing client-controlled
++  (tool name, `_meta`, `requestState`, progress tokens) may influence the target URL or headers.
++- Tool name resolution cannot reach a server/tool outside the catalog or a disabled server.
++- Progress / cancellation routing cannot leak notifications to another client.
++
++**LLM-facing content (prompt injection / tool poisoning)**
++- Upstream tool names, descriptions and schemas flow into `search_tools` results, the
++  catalog and the guide: check they are not given more authority than data (e.g. mixed into
++  the gateway's own instructions) and that size is bounded.
++- Error messages returned as `isError` do not echo secrets or internal URLs needlessly.
++
++**Logs & metrics**
++- No secrets or full tool arguments in logs; client-supplied strings truncated (log
++  injection, volume); `FEEDBACK` logs capped.
++- No client-controlled metric label (cardinality DoS).
++
++**Supply chain & deployment**
++- New crates: maintenance, `default-features`, `unsafe`, TLS stays rustls.
++- Dockerfile: distroless `nonroot`, no secrets in layers, `--locked` build.
++- Kubernetes: no privilege escalation, read-only config mount, resource limits.
++- GitHub Actions: minimal `permissions`, no untrusted input in `run:` (script injection
++  via PR titles/branch names), third-party actions trusted or pinned.
++
++**Future auth (if the change touches it)**: MCP authorization = OAuth 2.1, gateway as
++resource server; audience/issuer checks, no token passthrough, no identifier in metric labels.
++
++Only report issues with a credible exploitation scenario; no generic boilerplate.
++
++## Output
++Each finding: severity (CRITICAL / HIGH / MEDIUM / LOW), `file:line`, exploitation scenario,
++recommended fix. End with **OK TO MERGE** or **BLOCKED**.
+diff --git a/.gitignore b/.gitignore
+index ea8c4bf..f1e5ee8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,4 @@
+ /target
++
++# Claude Code: implementation plans written by the architect agent (not versioned)
++.claude/plans/
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index 90a6f85..1bc5588 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -1,7 +1,8 @@
+ # MCPortal architecture
+ 
+ This document describes the code layout and the internals of the gateway. For usage, see
+-the [README](README.md). Design choices and their rationale are grouped at the end, in
++the [README](README.md). Design choices and their rationale are recorded as
++[Architecture Decision Records](docs/adr/README.md), summarized in
+ [Design decisions](#design-decisions).
+ 
+ Guiding principle: **simplicity first**. A single crate, an immutable shared state, no lock
+@@ -151,7 +152,7 @@ can also extract the servers and tools cited by a guide, which the drift tests u
+ 
+ One semaphore **per server** (`max_concurrency`), acquired within `acquire_timeout_seconds`.
+ There is no global limit: it would couple the servers to one another (see
+-[Design decisions](#concurrency-and-limits-per-server-in-v1)). Permits are released automatically when the `CallPermit` is dropped, including on error or
++[ADR-0004](docs/adr/0004-per-server-concurrency-limits.md)). Permits are released automatically when the `CallPermit` is dropped, including on error or
+ cancellation. Past the timeout, the call is rejected with a readable message.
+ 
+ ### `server` and `main`: HTTP and lifecycle
+@@ -298,105 +299,22 @@ longer value is rejected with a tool error that tells the LLM to shorten it.
+ 
+ ## Design decisions
+ 
+-This section records the **why** behind the structural choices, so that they can be
+-challenged with full knowledge of the trade-offs.
++The **why** behind the structural choices is recorded as Architecture Decision Records in
++[`docs/adr/`](docs/adr/README.md), so that each decision can be challenged, and superseded,
++with full knowledge of the trade-offs. Summary:
+ 
+-### MCP protocol 2026-07-28 and stateless mode
+-
+-The 2026-07-28 revision of the MCP spec removes sessions (`Mcp-Session-Id`) and the
+-`initialize` handshake: each request carries its protocol version, the client's
+-capabilities and identity in `_meta`.
+-
+-- **Downstream**, the gateway serves every request without a session, including for older
+-  clients (`legacy_session_mode(false)`). Consequence: any pod can serve any request.
+-  Several replicas work without sticky sessions, and a pod restart disconnects no client.
+-- **Upstream**, one rmcp client shared per server. Upstreams still on a 2025-xx version keep
+-  their sessions, managed by rmcp (an expired session is reopened automatically).
+-- `tools/list` returns `ttlMs` and `cacheScope: public`: the list is the same for every
+-  client.
+-
+-### No configuration hot reload
+-
+-The goal was to avoid outages when the config changes on Kubernetes. With a sessionless
+-protocol, a **rolling update** is enough and disconnects no one:
+-
+-1. the ConfigMap changes; a `checksum/config` annotation (Helm) or the Reloader tool
+-   triggers the rolling update;
+-2. the new pod starts and only reports ready after the first tool load;
+-3. the old pod receives SIGTERM, reports not ready and finishes its in-flight calls.
+-
+-What makes this possible is the graceful shutdown described above, together with a
+-`preStop` of a few seconds on the Kubernetes side and a `terminationGracePeriodSeconds`
+-greater than the largest upstream `timeout`.
+-
+-The cost of a hot reload would have been moderate (about 200 lines), but with pitfalls:
+-semaphores resized while permits are held, non-reloadable settings (listening port),
+-reliable detection of ConfigMap updates (atomic replacement of a symbolic link). If the
+-need comes back, the catalog's `ArcSwap` already provides the swap mechanism: what would
+-remain is watching the file and diffing the upstreams.
+-
+-### Concurrency and limits: per server in V1
+-
+-One limit per server (`max_concurrency`) protects each upstream without needing to know who
+-is calling. There is no authentication and no per-user limit in V1.
+-
+-A global limit across all servers existed at first and was removed. It did not protect the
+-gateway (an in-flight call costs a tokio task and an HTTP request, and the total is already
+-bounded by the sum of the servers' limits), but it **coupled the servers**: calls waiting
+-for a permit on a slow or failing server held global permits, and calls to healthy servers
+-were rejected as "saturated". Below the sum of the servers' limits it causes this coupling;
+-above it, it never applies. The `global_limit` key is still accepted in the registry
+-(ignored, with a warning) so that existing configs keep loading. If the gateway itself ever
+-needs protecting, it belongs on incoming requests (a concurrency layer on `/mcp`, or
+-autoscaling), not on upstream calls.
+-
+-Points to keep in mind for later:
+-
+-- **The MCP client does not identify the user**: `clientInfo` describes the software (and
+-  is self-declared), `Mcp-Session-Id` no longer exists. The only mechanism provided by the
+-  spec is `Authorization: Bearer` (OAuth 2.1), with the gateway acting as the *resource
+-  server*.
+-- **A per-IP-address limit does not work with Claude.ai**: connectors call from
+-  Anthropic's servers, so all their users would share a few addresses.
+-- Options considered, from simplest to most complete:
+-
+-  | Mode | Identity | Note |
+-  | --- | --- | --- |
+-  | `api_key` | personal key in `Authorization: Bearer` | simple, no identity provider; keys in a Kubernetes Secret |
+-  | `oauth` | token from an identity provider (Keycloak, possibly federated with GitHub or Google) | the cleanest; the user signs in through their browser. Limitation: an account on that provider is required |
+-
+-- **Never forward a user's token to the upstreams** (forbidden by the spec, "confused
+-  deputy" risk): if an upstream requires authentication, the gateway uses its own
+-  credentials.
+-
+-### Search with the `bm25` crate
+-
+-There are at most a few hundred tools: the index is rebuilt in a few milliseconds and fits
+-in memory. A full engine (tantivy) or an embedded database (DuckDB and its full-text
+-extension) would be oversized. The module is isolated behind the `ToolIndex` trait with a
+-view to contributing it to the rmcp SDK (optional module or separate crate, to be
+-discussed with its maintainers first).
+-
+-### Catalog as resources rather than tools
+-
+-A resource costs nothing in the client's context until it reads it, and it stays readable
+-when tool search hides `tools/list`. The catalog is always generated from the registry and
+-the upstreams' state; the deployment guide contains narrative and pointers, never an
+-inventory.
+-
+-### Prometheus metrics on top of logs
+-
+-JSON logs go to Loki, but computing latencies and error rates from logs is costly and
+-imprecise. Prometheus metrics, served on a separate port that is not publicly exposed, feed
+-the Grafana dashboards cheaply.
+-
+-### Upstream `sse` transport not supported
+-
+-The old HTTP+SSE transport is deprecated by the spec and no longer exists in the rmcp 3.x
+-client. The value is still accepted in the registry so as not to break an existing config,
+-but the server is reported `unavailable` with an explicit message.
++| ADR | Decision | Main rejected option |
++| --- | --- | --- |
++| [0002](docs/adr/0002-mcp-2026-07-28-stateless.md) | MCP 2026-07-28, stateless: any pod serves any request | MCP sessions (would require sticky sessions) |
++| [0003](docs/adr/0003-no-configuration-hot-reload.md) | Config change = rolling update | Hot reload (pointless without sessions) |
++| [0004](docs/adr/0004-per-server-concurrency-limits.md) | Concurrency limit per server | Global limit (couples the servers without protecting the gateway) |
++| [0005](docs/adr/0005-no-authentication-in-v1.md) | No authentication, no per-user limit in V1 | Per-IP limit (ineffective with Claude.ai connectors) |
++| [0006](docs/adr/0006-bm25-search.md) | BM25 search with the `bm25` crate | tantivy / DuckDB (oversized) |
++| [0007](docs/adr/0007-catalog-as-resources.md) | Catalog exposed as resources | Catalog tools, hand-written inventory |
++| [0008](docs/adr/0008-prometheus-metrics.md) | Prometheus metrics on a private port | Metrics computed from logs |
++| [0009](docs/adr/0009-no-upstream-sse-transport.md) | No upstream `sse` transport | Implementing a deprecated transport |
+ 
+-### Overhead measurement
++## Overhead measurement
+ 
+ Measured locally with `cargo bench --bench overhead`:
+ 
+@@ -409,15 +327,3 @@ Measured locally with `cargo bench --bench overhead`:
+ The overhead (~0.9 ms) mostly comes from the extra HTTP hop; the gateway's own processing
+ (resolution, validation, semaphores) is negligible. Plain JSON responses rather than an SSE
+ stream (`json_response`) reduced it by about 20%.
+-
+-### Summary of rejected options
+-
+-| Option | Why not (for now) |
+-| --- | --- |
+-| Configuration hot reload | pointless without sessions: a rolling update disconnects no one |
+-| MCP sessions | removed by the 2026-07-28 spec; they would require sticky sessions |
+-| tantivy / DuckDB for search | oversized for a few hundred tools |
+-| Authentication, per-user limits | postponed until after V1 (see above) |
+-| Per-IP-address limit | ineffective with Claude.ai connectors |
+-| Global concurrency limit | couples the servers to one another without protecting the gateway |
+-| Upstream `sse` transport | deprecated by the spec and absent from the rmcp 3.x client |
+diff --git a/CLAUDE.md b/CLAUDE.md
+new file mode 100644
+index 0000000..6106139
+--- /dev/null
++++ b/CLAUDE.md
+@@ -0,0 +1,37 @@
++# MCPortal
++
++Rust MCP gateway (single crate). Sources of truth, not duplicated here:
++- `ARCHITECTURE.md`: how the code works **now** (modules, lifecycle, metrics).
++- `docs/adr/`: **why** it works that way (one Architecture Decision Record per structural decision).
++- `CONTRIBUTING.md`: conventions and PR checklist.
++
++## Commands
++```bash
++cargo fmt --all --check
++cargo clippy --all-targets -- -D warnings
++cargo test
++cargo bench --bench overhead                  # if gateway.rs, upstream.rs, limits.rs or state.rs changed
++cargo test --test guide_drift -- --ignored    # real network; only if registry.yaml or guide-ssp.md changed
++cargo run -- --config registry.yaml           # local gateway on :8000/mcp, metrics on :9090
++```
++
++## Agent workflow
++For a feature, a new config key, a change on the call path or a non-trivial refactor, the
++main session orchestrates and does not code itself:
++
++1. **architect** → writes `.claude/plans/<feature>.md` and, for a structural decision, an ADR
++   `docs/adr/NNNN-….md` (status Proposed). Show me both and wait for my approval.
++2. **rust-dev** → implements the tasks, updates `ARCHITECTURE.md` in the same branch and sets
++   the ADR to Accepted. Split into several sequential rust-dev runs if the
++   plan has independent tasks; never two in parallel on the same files.
++3. **reviewer** → on CHANGES REQUIRED, send BLOCKING / SHOULD FIX items back to rust-dev, then re-review.
++4. **security-reviewer** → run it when the change touches HTTP handling, tool arguments,
++   upstream relaying, catalog/guide content, logs/metrics, dependencies, Docker, k8s or CI.
++   On BLOCKED, same loop.
++5. At most 2 fix loops; beyond that, stop and ask me.
++
++Skip the squad for small fixes (typo, docs, one-line change, `website/`): do them directly,
++then run the checks above.
++
++Branches `feat/…`, `fix/…`, `docs/…`; Conventional Commits; PR against `main` with the
++CONTRIBUTING checklist.
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 6523255..de4da85 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -91,6 +91,7 @@ cargo test --test guide_drift -- --ignored
+ - [ ] A new configuration key has a default value, validation if needed, and appears in the
+       README.
+ - [ ] A new metric is declared in `telemetry::metric` and listed in ARCHITECTURE.
++- [ ] A structural decision has an ADR in `docs/adr/` (see below).
+ 
+ ## Code conventions
+ 
+@@ -138,6 +139,20 @@ cargo test --test guide_drift -- --ignored
+ 4. Add a unit test in `config.rs`.
+ 5. Document the key in the README.
+ 
++### Recording an architecture decision
++
++A structural decision (new dependency, protocol behavior, state or concurrency model,
++security posture, public contract seen by clients or the LLM, or reversal of an earlier
++decision) gets an Architecture Decision Record:
++
++1. Copy `docs/adr/template.md` to `docs/adr/NNNN-short-title.md` (next free number) and add
++   it to `docs/adr/README.md` and to the summary in `ARCHITECTURE.md`.
++2. Status `Proposed` in the pull request, `Accepted` when merged.
++3. An accepted ADR is not rewritten: write a new one that supersedes it and mark the old one
++   `Superseded by ADR-NNNN`.
++
++`ARCHITECTURE.md` describes how the code works now; ADRs record why.
++
+ ### Changing the guide
+ 
+ - `src/guide.md` (mechanics) must cite **no** server or tool of a deployment; the
+diff --git a/README.md b/README.md
+index 2bcd483..b935ea2 100644
+--- a/README.md
++++ b/README.md
+@@ -145,7 +145,8 @@ measurement.
+ ## Documentation
+ 
+ - [Website](https://inseefrlab.github.io/MCPortal/): project landing page (source in [`website/`](website/)).
+-- [ARCHITECTURE.md](ARCHITECTURE.md): code layout, internals and design decisions.
++- [ARCHITECTURE.md](ARCHITECTURE.md): code layout and internals.
++- [docs/adr/](docs/adr/README.md): architecture decision records (the why).
+ - [CONTRIBUTING.md](CONTRIBUTING.md): how to contribute.
+ - [`src/guide.md`](src/guide.md): usage guide served to MCP clients.
+ 
+@@ -156,7 +157,7 @@ measurement.
+ - Upstream `sse` transport not supported (deprecated by the MCP spec).
+ 
+ The reasons for these choices are detailed in
+-[ARCHITECTURE.md](ARCHITECTURE.md#design-decisions).
++the [Architecture Decision Records](docs/adr/README.md).
+ 
+ ## Contributing
+ 
+diff --git a/docs/adr/0001-record-architecture-decisions.md b/docs/adr/0001-record-architecture-decisions.md
+new file mode 100644
+index 0000000..1e486bb
+--- /dev/null
++++ b/docs/adr/0001-record-architecture-decisions.md
+@@ -0,0 +1,33 @@
++# 0001. Record architecture decisions
++
++- Status: Accepted
++- Date: 2026-11-19
++
++## Context
++
++Design choices used to live in a *Design decisions* section of `ARCHITECTURE.md`. As the
++project grows (authentication, per-user limits…), decisions get revisited, and rewriting a
++section in place loses the history of what was decided, when and why it changed.
++
++## Decision
++
++Record each structural decision as an Architecture Decision Record in `docs/adr/`, one
++file per decision, numbered `NNNN-short-title.md` and listed in `docs/adr/README.md`.
++
++- `ARCHITECTURE.md` describes how the code works **now**; ADRs record **why**.
++- An ADR is written for a structural decision: new dependency, protocol behavior,
++  state/concurrency model, security posture, public contract seen by clients or the LLM, or
++  reversal of an earlier ADR. Not for a routine change following existing patterns.
++- Lifecycle: `Proposed` (in the PR) → `Accepted` (merged). An accepted ADR is not rewritten:
++  a new ADR supersedes it and the old one is marked `Superseded by ADR-NNNN`.
++
++## Alternatives considered
++
++- Keep the section in `ARCHITECTURE.md`: simple, but no status or history, and every
++  decision makes the file longer.
++- A wiki or issues: decisions would drift away from the code they explain.
++
++## Consequences
++
++- Decisions are reviewed in the same pull request as the code.
++- `ARCHITECTURE.md` keeps a one-line summary per decision with a link to its ADR.
+diff --git a/docs/adr/0002-mcp-2026-07-28-stateless.md b/docs/adr/0002-mcp-2026-07-28-stateless.md
+new file mode 100644
+index 0000000..0cd3731
+--- /dev/null
++++ b/docs/adr/0002-mcp-2026-07-28-stateless.md
+@@ -0,0 +1,32 @@
++# 0002. MCP protocol 2026-07-28 and stateless mode
++
++- Status: Accepted
++- Date: 2026-11-19
++- Note: Recorded retroactively: moved from the *Design decisions* section of `ARCHITECTURE.md`.
++
++## Context
++
++The 2026-07-28 revision of the MCP spec removes sessions (`Mcp-Session-Id`) and the
++`initialize` handshake: each request carries its protocol version, the client's
++capabilities and identity in `_meta`.
++
++## Decision
++
++- **Downstream**, the gateway serves every request without a session, including for older
++  clients (`legacy_session_mode(false)`).
++- **Upstream**, one rmcp client shared per server. Upstreams still on a 2025-xx version keep
++  their sessions, managed by rmcp (an expired session is reopened automatically).
++- `tools/list` returns `ttlMs` and `cacheScope: public`: the list is the same for every
++  client.
++
++## Alternatives considered
++
++- Keep MCP sessions: they require sticky sessions in front of the replicas, and a pod
++  restart disconnects clients.
++
++## Consequences
++
++- Any pod can serve any request: several replicas work without sticky sessions, and a pod
++  restart disconnects no client.
++- No per-client state may be introduced in the gateway.
++- Enables configuration changes through rolling updates (ADR-0003).
+diff --git a/docs/adr/0003-no-configuration-hot-reload.md b/docs/adr/0003-no-configuration-hot-reload.md
+new file mode 100644
+index 0000000..4ec2bbc
+--- /dev/null
++++ b/docs/adr/0003-no-configuration-hot-reload.md
+@@ -0,0 +1,35 @@
++# 0003. No configuration hot reload
++
++- Status: Accepted
++- Date: 2026-11-19
++- Note: Recorded retroactively: moved from the *Design decisions* section of `ARCHITECTURE.md`.
++
++## Context
++
++The goal was to avoid outages when the config changes on Kubernetes.
++
++## Decision
++
++A configuration change is deployed through a **rolling update**. With a sessionless
++protocol (ADR-0002), it disconnects no one:
++
++1. the ConfigMap changes; a `checksum/config` annotation (Helm) or the Reloader tool
++   triggers the rolling update;
++2. the new pod starts and only reports ready after the first tool load;
++3. the old pod receives SIGTERM, reports not ready and finishes its in-flight calls.
++
++What makes this possible is the graceful shutdown, together with a `preStop` of a few
++seconds on the Kubernetes side and a `terminationGracePeriodSeconds` greater than the
++largest upstream `timeout`.
++
++## Alternatives considered
++
++- Hot reload: moderate cost (about 200 lines), but with pitfalls: semaphores resized while
++  permits are held, non-reloadable settings (listening port), reliable detection of
++  ConfigMap updates (atomic replacement of a symbolic link).
++
++## Consequences
++
++- Simpler code, no partially applied configuration.
++- If the need comes back, the catalog's `ArcSwap` already provides the swap mechanism: what
++  would remain is watching the file and diffing the upstreams.
+diff --git a/docs/adr/0004-per-server-concurrency-limits.md b/docs/adr/0004-per-server-concurrency-limits.md
+new file mode 100644
+index 0000000..5496ad1
+--- /dev/null
++++ b/docs/adr/0004-per-server-concurrency-limits.md
+@@ -0,0 +1,32 @@
++# 0004. Concurrency limits per server, no global limit
++
++- Status: Accepted
++- Date: 2026-11-19
++- Note: Recorded retroactively: moved from the *Design decisions* section of `ARCHITECTURE.md`.
++
++## Context
++
++Each upstream must be protected from overload. The gateway does not know who is calling
++(see ADR-0005).
++
++## Decision
++
++One limit per server (`max_concurrency`), acquired within `acquire_timeout_seconds`. There
++is no global limit across servers.
++
++## Alternatives considered
++
++- **Global limit** (existed at first, removed): it did not protect the gateway (an
++  in-flight call costs a tokio task and an HTTP request, and the total is already bounded
++  by the sum of the servers' limits), but it **coupled the servers**: calls waiting for a
++  permit on a slow or failing server held global permits, and calls to healthy servers were
++  rejected as "saturated". Below the sum of the servers' limits it causes this coupling;
++  above it, it never applies.
++
++## Consequences
++
++- A slow or failing upstream cannot starve the others.
++- The `global_limit` key is still accepted in the registry (ignored, with a warning) so that
++  existing configs keep loading.
++- If the gateway itself ever needs protecting, it belongs on incoming requests (a
++  concurrency layer on `/mcp`, or autoscaling), not on upstream calls.
+diff --git a/docs/adr/0005-no-authentication-in-v1.md b/docs/adr/0005-no-authentication-in-v1.md
+new file mode 100644
+index 0000000..cd05741
+--- /dev/null
++++ b/docs/adr/0005-no-authentication-in-v1.md
+@@ -0,0 +1,37 @@
++# 0005. No authentication and no per-user limit in V1
++
++- Status: Accepted
++- Date: 2026-11-19
++- Note: Recorded retroactively: moved from the *Design decisions* section of `ARCHITECTURE.md`.
++
++## Context
++
++A per-user limit requires knowing the user, and MCP clients do not identify them:
++`clientInfo` describes the software (and is self-declared), and `Mcp-Session-Id` no longer
++exists. The only mechanism provided by the spec is `Authorization: Bearer` (OAuth 2.1), with
++the gateway acting as the *resource server*.
++
++## Decision
++
++V1 has no authentication and no per-user limit. The `/mcp` endpoint is public, so free
++text is capped (`search_tools.query` 500 characters, `send_feedback.author` 200,
++`send_feedback.feedback` 4000).
++
++## Alternatives considered
++
++- **Per-IP-address limit**: does not work with Claude.ai, whose connectors call from
++  Anthropic's servers, so all their users would share a few addresses.
++- Options for later, from simplest to most complete:
++
++  | Mode | Identity | Note |
++  | --- | --- | --- |
++  | `api_key` | personal key in `Authorization: Bearer` | simple, no identity provider; keys in a Kubernetes Secret |
++  | `oauth` | token from an identity provider (Keycloak, possibly federated with GitHub or Google) | the cleanest; the user signs in through their browser. Limitation: an account on that provider is required |
++
++## Consequences
++
++- Simple deployment, but no per-user accounting or abuse protection beyond the per-server
++  limits (ADR-0004).
++- When authentication is added: **never forward a user's token to the upstreams**
++  (forbidden by the spec, "confused deputy" risk); if an upstream requires authentication,
++  the gateway uses its own credentials. No user identifier as a metric label.
+diff --git a/docs/adr/0006-bm25-search.md b/docs/adr/0006-bm25-search.md
+new file mode 100644
+index 0000000..16e80ac
+--- /dev/null
++++ b/docs/adr/0006-bm25-search.md
+@@ -0,0 +1,26 @@
++# 0006. Tool search with the `bm25` crate
++
++- Status: Accepted
++- Date: 2026-11-19
++- Note: Recorded retroactively: moved from the *Design decisions* section of `ARCHITECTURE.md`.
++
++## Context
++
++`search_tools` needs full-text search over the tools of every upstream. There are at most a
++few hundred tools.
++
++## Decision
++
++Use the `bm25` crate with a French tokenizer, behind the `ToolIndex` trait. The index is
++rebuilt with the catalog, in memory.
++
++## Alternatives considered
++
++- tantivy: a full engine, oversized for a few hundred tools.
++- DuckDB and its full-text extension: an embedded database, oversized as well.
++
++## Consequences
++
++- The index is rebuilt in a few milliseconds and fits in memory.
++- The module depends only on `rmcp::model::Tool`, so it can be extracted (separate crate or
++  contribution to the rmcp SDK, to be discussed with its maintainers first).
+diff --git a/docs/adr/0007-catalog-as-resources.md b/docs/adr/0007-catalog-as-resources.md
+new file mode 100644
+index 0000000..891eac1
+--- /dev/null
++++ b/docs/adr/0007-catalog-as-resources.md
+@@ -0,0 +1,28 @@
++# 0007. Catalog as resources rather than tools
++
++- Status: Accepted
++- Date: 2026-11-19
++- Note: Recorded retroactively: moved from the *Design decisions* section of `ARCHITECTURE.md`.
++
++## Context
++
++Clients need to discover the servers, domains and tools behind the gateway without loading
++every tool definition into their context.
++
++## Decision
++
++Expose the catalog as MCP resources (`catalog://servers`, `catalog://domains`,
++`catalog://servers/{name}`, `catalog://servers/{name}/tools`, `catalog://guide`), always
++generated from the registry and the upstreams' state.
++
++## Alternatives considered
++
++- Catalog tools: they would cost context on every request through their definitions.
++- A hand-written inventory in the guide: a second source of truth that drifts.
++
++## Consequences
++
++- A resource costs nothing in the client's context until it reads it, and it stays
++  readable when tool search hides `tools/list`.
++- The deployment guide contains narrative and pointers, never an inventory; drift tests
++  check it.
+diff --git a/docs/adr/0008-prometheus-metrics.md b/docs/adr/0008-prometheus-metrics.md
+new file mode 100644
+index 0000000..8e4d312
+--- /dev/null
++++ b/docs/adr/0008-prometheus-metrics.md
+@@ -0,0 +1,25 @@
++# 0008. Prometheus metrics on top of logs
++
++- Status: Accepted
++- Date: 2026-11-19
++- Note: Recorded retroactively: moved from the *Design decisions* section of `ARCHITECTURE.md`.
++
++## Context
++
++JSON logs go to Loki, but computing latencies and error rates from logs is costly and
++imprecise.
++
++## Decision
++
++Expose Prometheus metrics (through the `metrics` facade) on a separate port (9090) that is
++not publicly exposed. All metric names are declared in `telemetry::metric`.
++
++## Alternatives considered
++
++- Logs only: costly and imprecise for latencies and error rates.
++
++## Consequences
++
++- Grafana dashboards are fed cheaply.
++- No metric carries a user identifier or a value chosen by the client, to avoid a
++  cardinality explosion.
+diff --git a/docs/adr/0009-no-upstream-sse-transport.md b/docs/adr/0009-no-upstream-sse-transport.md
+new file mode 100644
+index 0000000..76ad71c
+--- /dev/null
++++ b/docs/adr/0009-no-upstream-sse-transport.md
+@@ -0,0 +1,25 @@
++# 0009. Upstream `sse` transport not supported
++
++- Status: Accepted
++- Date: 2026-11-19
++- Note: Recorded retroactively: moved from the *Design decisions* section of `ARCHITECTURE.md`.
++
++## Context
++
++The old HTTP+SSE transport is deprecated by the MCP spec and no longer exists in the rmcp
++3.x client.
++
++## Decision
++
++Only Streamable HTTP is supported upstream. The `sse` value is still accepted in the
++registry so as not to break an existing config, but the server is reported `unavailable`
++with an explicit message.
++
++## Alternatives considered
++
++- Implementing the deprecated transport ourselves: maintenance cost for a transport that
++  is being phased out.
++
++## Consequences
++
++- Existing registries keep loading; affected servers are visible as unavailable.
+diff --git a/docs/adr/README.md b/docs/adr/README.md
+new file mode 100644
+index 0000000..45a2b36
+--- /dev/null
++++ b/docs/adr/README.md
+@@ -0,0 +1,19 @@
++# Architecture Decision Records
++
++Why MCPortal is built the way it is. How it works now is described in
++[ARCHITECTURE.md](../../ARCHITECTURE.md). Process: see [ADR-0001](0001-record-architecture-decisions.md).
++
++New ADR: copy [template.md](template.md) to the next free number, status `Proposed` in the pull
++request, `Accepted` when merged. An accepted ADR is not rewritten: supersede it.
++
++| ADR | Title | Status |
++| --- | --- | --- |
++| [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted |
++| [0002](0002-mcp-2026-07-28-stateless.md) | MCP protocol 2026-07-28 and stateless mode | Accepted |
++| [0003](0003-no-configuration-hot-reload.md) | No configuration hot reload | Accepted |
++| [0004](0004-per-server-concurrency-limits.md) | Concurrency limits per server, no global limit | Accepted |
++| [0005](0005-no-authentication-in-v1.md) | No authentication and no per-user limit in V1 | Accepted |
++| [0006](0006-bm25-search.md) | Tool search with the `bm25` crate | Accepted |
++| [0007](0007-catalog-as-resources.md) | Catalog as resources rather than tools | Accepted |
++| [0008](0008-prometheus-metrics.md) | Prometheus metrics on top of logs | Accepted |
++| [0009](0009-no-upstream-sse-transport.md) | Upstream `sse` transport not supported | Accepted |
+diff --git a/docs/adr/template.md b/docs/adr/template.md
+new file mode 100644
+index 0000000..d388297
+--- /dev/null
++++ b/docs/adr/template.md
+@@ -0,0 +1,21 @@
++# NNNN. Title
++
++- Status: Proposed
++- Date: YYYY-MM-DD
++- Supersedes: ADR-XXXX (remove if none)
++
++## Context
++
++The forces at play, the constraints, what the current design cannot do.
++
++## Decision
++
++What we do, in a few sentences.
++
++## Alternatives considered
++
++Each option and why it was rejected.
++
++## Consequences
++
++What becomes easier, harder, and what to revisit later.
+-- 
+2.43.0
+
