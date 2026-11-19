@@ -1,1 +1,4 @@
 /target
+
+# Claude Code: implementation plans written by the architect agent (not versioned)
+.claude/plans/

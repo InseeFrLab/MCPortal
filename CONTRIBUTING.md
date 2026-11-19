@@ -91,6 +91,7 @@ cargo test --test guide_drift -- --ignored
 - [ ] A new configuration key has a default value, validation if needed, and appears in the
       README.
 - [ ] A new metric is declared in `telemetry::metric` and listed in ARCHITECTURE.
+- [ ] A structural decision has an ADR in `docs/adr/` (see below).
 
 ## Code conventions
 
@@ -137,6 +138,20 @@ cargo test --test guide_drift -- --ignored
 3. Add validation in `Config::validate` if the value can be inconsistent.
 4. Add a unit test in `config.rs`.
 5. Document the key in the README.
+
+### Recording an architecture decision
+
+A structural decision (new dependency, protocol behavior, state or concurrency model,
+security posture, public contract seen by clients or the LLM, or reversal of an earlier
+decision) gets an Architecture Decision Record:
+
+1. Copy `docs/adr/template.md` to `docs/adr/NNNN-short-title.md` (next free number) and add
+   it to `docs/adr/README.md` and to the summary in `ARCHITECTURE.md`.
+2. Status `Proposed` in the pull request, `Accepted` when merged.
+3. An accepted ADR is not rewritten: write a new one that supersedes it and mark the old one
+   `Superseded by ADR-NNNN`.
+
+`ARCHITECTURE.md` describes how the code works now; ADRs record why.
 
 ### Changing the guide
 

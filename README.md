@@ -165,7 +165,8 @@ measurement.
 ## Documentation
 
 - [Website](https://inseefrlab.github.io/MCPortal/): project landing page (source in [`website/`](website/)).
-- [ARCHITECTURE.md](ARCHITECTURE.md): code layout, internals and design decisions.
+- [ARCHITECTURE.md](ARCHITECTURE.md): code layout and internals.
+- [docs/adr/](docs/adr/README.md): architecture decision records (the why).
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to contribute.
 - [`src/guide.md`](src/guide.md): usage guide served to MCP clients.
 
@@ -176,7 +177,7 @@ measurement.
 - Upstream `sse` transport not supported (deprecated by the MCP spec).
 
 The reasons for these choices are detailed in
-[ARCHITECTURE.md](ARCHITECTURE.md#design-decisions).
+the [Architecture Decision Records](docs/adr/README.md).
 
 ## Contributing
 

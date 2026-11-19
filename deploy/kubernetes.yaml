@@ -38,8 +38,28 @@ data:
         tags: [dataset, publications]
         enabled: true
         timeout: 30.0
-        max_concurrency: 4
+        max_concurrency: 16
         cache_ttl: 300
+      - name: geodata
+        url: https://geollm.beta.ign.fr/geocontext/mcp
+        transport: http
+        domain: geographie
+        description: Données géographiques de l'IGN
+        tags: [carte]
+        enabled: true
+        timeout: 45.0
+        max_concurrency: 8
+        cache_ttl: 600
+      - name: sirene
+        url: https://mcpsirene.lab.sspcloud.fr/mcp
+        transport: http
+        domain: diffusion
+        description: Données du répertoire d'entreprises sirene
+        tags: [sirene]
+        enabled: true
+        timeout: 45.0
+        max_concurrency: 8
+        cache_ttl: 600
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -66,7 +86,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: mcportal
-          image: ghcr.io/inseefrlab/mcportal:0.1.0
+          image: ghcr.io/inseefrlab/mcportal:sha-ed004c1
           # MCPORTAL_CONFIG=/config/registry.yaml is already set in the image.
           ports:
             - {name: mcp, containerPort: 8000}
@@ -124,7 +144,7 @@ spec:
     - hosts: [mcportal.example.org]       # to adapt
       secretName: mcportal-tls            # to adapt (or let cert-manager create it)
   rules:
-    - host: mcportal.example.org          # to adapt
+    - host: mcportal.lab.sspcloud.fr         # to adapt
       http:
         paths:
           - path: /mcp
