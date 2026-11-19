@@ -1,7 +1,8 @@
 # MCPortal architecture
 
 This document describes the code layout and the internals of the gateway. For usage, see
-the [README](README.md). Design choices and their rationale are grouped at the end, in
+the [README](README.md). Design choices and their rationale are recorded as
+[Architecture Decision Records](docs/adr/README.md), summarized in
 [Design decisions](#design-decisions).
 
 Guiding principle: **simplicity first**. A single crate, an immutable shared state, no lock
@@ -151,7 +152,7 @@ can also extract the servers and tools cited by a guide, which the drift tests u
 
 One semaphore **per server** (`max_concurrency`), acquired within `acquire_timeout_seconds`.
 There is no global limit: it would couple the servers to one another (see
-[Design decisions](#concurrency-and-limits-per-server-in-v1)). Permits are released automatically when the `CallPermit` is dropped, including on error or
+[ADR-0004](docs/adr/0004-per-server-concurrency-limits.md)). Permits are released automatically when the `CallPermit` is dropped, including on error or
 cancellation. Past the timeout, the call is rejected with a readable message.
 
 ### `server` and `main`: HTTP and lifecycle
@@ -298,105 +299,22 @@ longer value is rejected with a tool error that tells the LLM to shorten it.
 
 ## Design decisions
 
-This section records the **why** behind the structural choices, so that they can be
-challenged with full knowledge of the trade-offs.
+The **why** behind the structural choices is recorded as Architecture Decision Records in
+[`docs/adr/`](docs/adr/README.md), so that each decision can be challenged, and superseded,
+with full knowledge of the trade-offs. Summary:
 
-### MCP protocol 2026-07-28 and stateless mode
+| ADR | Decision | Main rejected option |
+| --- | --- | --- |
+| [0002](docs/adr/0002-mcp-2026-07-28-stateless.md) | MCP 2026-07-28, stateless: any pod serves any request | MCP sessions (would require sticky sessions) |
+| [0003](docs/adr/0003-no-configuration-hot-reload.md) | Config change = rolling update | Hot reload (pointless without sessions) |
+| [0004](docs/adr/0004-per-server-concurrency-limits.md) | Concurrency limit per server | Global limit (couples the servers without protecting the gateway) |
+| [0005](docs/adr/0005-no-authentication-in-v1.md) | No authentication, no per-user limit in V1 | Per-IP limit (ineffective with Claude.ai connectors) |
+| [0006](docs/adr/0006-bm25-search.md) | BM25 search with the `bm25` crate | tantivy / DuckDB (oversized) |
+| [0007](docs/adr/0007-catalog-as-resources.md) | Catalog exposed as resources | Catalog tools, hand-written inventory |
+| [0008](docs/adr/0008-prometheus-metrics.md) | Prometheus metrics on a private port | Metrics computed from logs |
+| [0009](docs/adr/0009-no-upstream-sse-transport.md) | No upstream `sse` transport | Implementing a deprecated transport |
 
-The 2026-07-28 revision of the MCP spec removes sessions (`Mcp-Session-Id`) and the
-`initialize` handshake: each request carries its protocol version, the client's
-capabilities and identity in `_meta`.
-
-- **Downstream**, the gateway serves every request without a session, including for older
-  clients (`legacy_session_mode(false)`). Consequence: any pod can serve any request.
-  Several replicas work without sticky sessions, and a pod restart disconnects no client.
-- **Upstream**, one rmcp client shared per server. Upstreams still on a 2025-xx version keep
-  their sessions, managed by rmcp (an expired session is reopened automatically).
-- `tools/list` returns `ttlMs` and `cacheScope: public`: the list is the same for every
-  client.
-
-### No configuration hot reload
-
-The goal was to avoid outages when the config changes on Kubernetes. With a sessionless
-protocol, a **rolling update** is enough and disconnects no one:
-
-1. the ConfigMap changes; a `checksum/config` annotation (Helm) or the Reloader tool
-   triggers the rolling update;
-2. the new pod starts and only reports ready after the first tool load;
-3. the old pod receives SIGTERM, reports not ready and finishes its in-flight calls.
-
-What makes this possible is the graceful shutdown described above, together with a
-`preStop` of a few seconds on the Kubernetes side and a `terminationGracePeriodSeconds`
-greater than the largest upstream `timeout`.
-
-The cost of a hot reload would have been moderate (about 200 lines), but with pitfalls:
-semaphores resized while permits are held, non-reloadable settings (listening port),
-reliable detection of ConfigMap updates (atomic replacement of a symbolic link). If the
-need comes back, the catalog's `ArcSwap` already provides the swap mechanism: what would
-remain is watching the file and diffing the upstreams.
-
-### Concurrency and limits: per server in V1
-
-One limit per server (`max_concurrency`) protects each upstream without needing to know who
-is calling. There is no authentication and no per-user limit in V1.
-
-A global limit across all servers existed at first and was removed. It did not protect the
-gateway (an in-flight call costs a tokio task and an HTTP request, and the total is already
-bounded by the sum of the servers' limits), but it **coupled the servers**: calls waiting
-for a permit on a slow or failing server held global permits, and calls to healthy servers
-were rejected as "saturated". Below the sum of the servers' limits it causes this coupling;
-above it, it never applies. The `global_limit` key is still accepted in the registry
-(ignored, with a warning) so that existing configs keep loading. If the gateway itself ever
-needs protecting, it belongs on incoming requests (a concurrency layer on `/mcp`, or
-autoscaling), not on upstream calls.
-
-Points to keep in mind for later:
-
-- **The MCP client does not identify the user**: `clientInfo` describes the software (and
-  is self-declared), `Mcp-Session-Id` no longer exists. The only mechanism provided by the
-  spec is `Authorization: Bearer` (OAuth 2.1), with the gateway acting as the *resource
-  server*.
-- **A per-IP-address limit does not work with Claude.ai**: connectors call from
-  Anthropic's servers, so all their users would share a few addresses.
-- Options considered, from simplest to most complete:
-
-  | Mode | Identity | Note |
-  | --- | --- | --- |
-  | `api_key` | personal key in `Authorization: Bearer` | simple, no identity provider; keys in a Kubernetes Secret |
-  | `oauth` | token from an identity provider (Keycloak, possibly federated with GitHub or Google) | the cleanest; the user signs in through their browser. Limitation: an account on that provider is required |
-
-- **Never forward a user's token to the upstreams** (forbidden by the spec, "confused
-  deputy" risk): if an upstream requires authentication, the gateway uses its own
-  credentials.
-
-### Search with the `bm25` crate
-
-There are at most a few hundred tools: the index is rebuilt in a few milliseconds and fits
-in memory. A full engine (tantivy) or an embedded database (DuckDB and its full-text
-extension) would be oversized. The module is isolated behind the `ToolIndex` trait with a
-view to contributing it to the rmcp SDK (optional module or separate crate, to be
-discussed with its maintainers first).
-
-### Catalog as resources rather than tools
-
-A resource costs nothing in the client's context until it reads it, and it stays readable
-when tool search hides `tools/list`. The catalog is always generated from the registry and
-the upstreams' state; the deployment guide contains narrative and pointers, never an
-inventory.
-
-### Prometheus metrics on top of logs
-
-JSON logs go to Loki, but computing latencies and error rates from logs is costly and
-imprecise. Prometheus metrics, served on a separate port that is not publicly exposed, feed
-the Grafana dashboards cheaply.
-
-### Upstream `sse` transport not supported
-
-The old HTTP+SSE transport is deprecated by the spec and no longer exists in the rmcp 3.x
-client. The value is still accepted in the registry so as not to break an existing config,
-but the server is reported `unavailable` with an explicit message.
-
-### Overhead measurement
+## Overhead measurement
 
 Measured locally with `cargo bench --bench overhead`:
 
@@ -409,15 +327,3 @@ Measured locally with `cargo bench --bench overhead`:
 The overhead (~0.9 ms) mostly comes from the extra HTTP hop; the gateway's own processing
 (resolution, validation, semaphores) is negligible. Plain JSON responses rather than an SSE
 stream (`json_response`) reduced it by about 20%.
-
-### Summary of rejected options
-
-| Option | Why not (for now) |
-| --- | --- |
-| Configuration hot reload | pointless without sessions: a rolling update disconnects no one |
-| MCP sessions | removed by the 2026-07-28 spec; they would require sticky sessions |
-| tantivy / DuckDB for search | oversized for a few hundred tools |
-| Authentication, per-user limits | postponed until after V1 (see above) |
-| Per-IP-address limit | ineffective with Claude.ai connectors |
-| Global concurrency limit | couples the servers to one another without protecting the gateway |
-| Upstream `sse` transport | deprecated by the spec and absent from the rmcp 3.x client |

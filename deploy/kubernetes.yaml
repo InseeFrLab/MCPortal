@@ -1,4 +1,8 @@
-# Example Kubernetes deployment of MCPortal.
+# Complete example of a Kubernetes deployment of MCPortal.
+#
+#   kubectl apply -f deploy/kubernetes.yaml
+#
+# To adapt: the Ingress host / TLS secret / ingressClassName, and the image tag.
 #
 # Config update = rolling update (no hot reload): change the ConfigMap then restart the
 # deployment (`kubectl rollout restart deploy/mcportal`), or automate it with a
@@ -7,24 +11,68 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mcportal-config
+  labels: {app: mcportal}
 data:
+  # Same content as the repository's registry.yaml, except `gateway.http`: inside the pod, the
+  # gateway must listen on 0.0.0.0 (127.0.0.1 would make it unreachable for the Service and
+  # the probes). allowed_hosts stays empty: the Ingress below already filters on the host.
   registry.yaml: |
-    # Content of registry.yaml (guide_path: guide-ssp.md, relative to this file), with
-    # `gateway.http` overridden: registry.yaml binds to 127.0.0.1 for local runs, which would
-    # make the pod unreachable. allowed_hosts stays empty: the Ingress below filters on host.
-    #   gateway:
-    #     http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
-  guide-ssp.md: |
-    # Content of guide-ssp.md
+    gateway:
+      name: SSP Gateway
+      tool_search: {enabled: true, max_results: 5}
+      # Once the servers cited by guide-ssp.md are declared below, add
+      # `guide_path: guide-ssp.md` (relative to this file, i.e. /config/guide-ssp.md) and
+      # put the guide's content in the `guide-ssp.md` key of this ConfigMap.
+      catalog: {enabled: true, include_tool_inventory: true, include_guide: true}
+      health: {enabled: true, path: /health, probe_interval_seconds: 60, failure_threshold: 2}
+      metrics: {log_level: INFO, json_logs: true, prometheus: {enabled: true, port: 9090}}
+      concurrency: {acquire_timeout_seconds: 5}
+      http: {bind: "0.0.0.0:8000", path: /mcp, allowed_hosts: []}
+
+    servers:
+      - name: mcpdiffusion
+        url: https://mcpdiffusion.lab.sspcloud.fr/mcp
+        transport: http
+        domain: diffusion
+        description: Server exposing Melodi, Rmes and insee.fr
+        tags: [dataset, publications]
+        enabled: true
+        timeout: 30.0
+        max_concurrency: 16
+        cache_ttl: 300
+      - name: geodata
+        url: https://geollm.beta.ign.fr/geocontext/mcp
+        transport: http
+        domain: geographie
+        description: Données géographiques de l'IGN
+        tags: [carte]
+        enabled: true
+        timeout: 45.0
+        max_concurrency: 8
+        cache_ttl: 600
+      - name: sirene
+        url: https://mcpsirene.lab.sspcloud.fr/mcp
+        transport: http
+        domain: diffusion
+        description: Données du répertoire d'entreprises sirene
+        tags: [sirene]
+        enabled: true
+        timeout: 45.0
+        max_concurrency: 8
+        cache_ttl: 600
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mcportal
+  labels: {app: mcportal}
 spec:
   replicas: 2                       # possible because the MCP server is stateless
   selector:
     matchLabels: {app: mcportal}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
   template:
     metadata:
       labels: {app: mcportal}
@@ -32,9 +80,14 @@ spec:
       # Must exceed the largest upstream `timeout` (30 s) + the preStop, to let in-flight
       # calls finish during shutdown.
       terminationGracePeriodSeconds: 45
+      automountServiceAccountToken: false   # the gateway never calls the Kubernetes API
+      securityContext:
+        runAsNonRoot: true                  # distroless :nonroot image (uid 65532)
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: mcportal
-          image: ghcr.io/inseefrlab/mcportal:0.1.0
+          image: ghcr.io/inseefrlab/mcportal:sha-ed004c1
+          # MCPORTAL_CONFIG=/config/registry.yaml is already set in the image.
           ports:
             - {name: mcp, containerPort: 8000}
             - {name: metrics, containerPort: 9090}
@@ -54,6 +107,10 @@ spec:
           resources:
             requests: {cpu: 100m, memory: 64Mi}
             limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
       volumes:
         - name: config
           configMap: {name: mcportal-config}
@@ -67,7 +124,7 @@ spec:
   selector: {app: mcportal}
   ports:
     - {name: mcp, port: 80, targetPort: mcp}
-    - {name: metrics, port: 9090, targetPort: metrics}   # do not expose through the ingress
+    - {name: metrics, port: 9090, targetPort: metrics}   # cluster-internal (Prometheus scrape)
 ---
 # Only /mcp is exposed. /health (detailed status, upstream errors with internal URLs) and
 # /ready stay reachable by the kubelet probes only; /metrics is on another port.
@@ -75,9 +132,19 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: mcportal
+  labels: {app: mcportal}
+  annotations:
+    # ingress-nginx: MCP responses may be SSE streams (progress notifications) — no buffering,
+    # and a read timeout above the largest upstream `timeout` (30 s).
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
 spec:
+  ingressClassName: nginx                 # to adapt
+  tls:
+    - hosts: [mcportal.example.org]       # to adapt
+      secretName: mcportal-tls            # to adapt (or let cert-manager create it)
   rules:
-    - host: mcportal.example.org          # to adapt
+    - host: mcportal.lab.sspcloud.fr         # to adapt
       http:
         paths:
           - path: /mcp
