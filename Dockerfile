@@ -4,7 +4,7 @@
 # Both stages must use the same Debian release: the binary links against the build stage's
 # glibc, so a newer build base than the runtime base fails at startup with
 # "GLIBC_x.yy not found". Bump them together.
-FROM rust:1.99-slim-trixie AS build
+FROM rust:1.100-slim-trixie AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
