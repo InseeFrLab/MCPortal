@@ -26,7 +26,7 @@ tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `search_tools(query, limit?)` | full-text search (BM25) across the tools of every server; returns their name and `inputSchema` |
+| `search_tools(query, limit?)` | full-text search (BM25) across the tools of every server; returns their name, `inputSchema` and, if declared, `outputSchema` |
 | `call_tool(name, arguments)` | calls an upstream tool by its full name `{server}_{tool}` |
 | `send_feedback(server, author, feedback)` | records feedback in the logs (label `FEEDBACK`) |
 

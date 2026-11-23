@@ -40,7 +40,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use rmcp::model::Tool;
+use rmcp::model::{JsonObject, Tool};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -62,6 +62,10 @@ pub struct ToolEntry {
     /// JSON Schema validator compiled from `inputSchema` (None if the schema is invalid:
     /// the upstream is then left to validate by itself).
     pub validator: Option<Arc<jsonschema::Validator>>,
+    /// JSON Schema validator compiled from `outputSchema`; None if the tool declares none or
+    /// if it cannot be compiled. Not used to validate `call_tool` responses, which are
+    /// relayed as is.
+    pub output_validator: Option<Arc<jsonschema::Validator>>,
 }
 
 /// Immutable catalog: every exposed tool + the search index.
@@ -158,17 +162,7 @@ impl AppState {
                     tracing::error!(tool = %name, server = upstream.name(), "duplicate exposed tool name, ignored");
                     continue;
                 }
-                let mut exposed = tool.clone();
-                exposed.name = name.clone().into();
-                tools.insert(
-                    name,
-                    ToolEntry {
-                        server: upstream.name().to_owned(),
-                        upstream_name: tool.name.to_string(),
-                        validator: compile_validator(tool),
-                        tool: exposed,
-                    },
-                );
+                tools.insert(name, tool_entry(upstream.name(), tool));
             }
         }
 
@@ -179,7 +173,22 @@ impl AppState {
             server_text: &server_texts[&entry.server],
         }));
 
-        // 3. Publish atomically.
+        // 3. Report, per server, the tools whose declaration is incomplete.
+        for q in catalog_quality(tools.values()) {
+            tracing::info!(
+                server = %q.server,
+                tools = q.tools,
+                without_output_schema = q.without_output_schema.len(),
+                invalid_output_schema = q.invalid_output_schema.len(),
+                without_annotations = q.without_annotations.len(),
+                without_output_schema_names = %sample_names(&q.without_output_schema),
+                invalid_output_schema_names = %sample_names(&q.invalid_output_schema),
+                without_annotations_names = %sample_names(&q.without_annotations),
+                "catalog quality"
+            );
+        }
+
+        // 4. Publish atomically.
         tracing::info!(tools = tools.len(), "tool catalog rebuilt");
         metrics::gauge!(metric::CATALOG_TOOLS).set(tools.len() as f64);
         self.catalog.store(Arc::new(ToolCatalog {
@@ -261,15 +270,259 @@ fn server_text(upstream: &Upstream) -> String {
     parts.join(" ")
 }
 
-/// Compiles a tool's input JSON Schema. A schema that cannot be compiled is not blocking:
-/// log it and let the upstream validate.
-fn compile_validator(tool: &Tool) -> Option<Arc<jsonschema::Validator>> {
-    let schema = serde_json::Value::Object((*tool.input_schema).clone());
+/// Builds the catalog entry of an upstream tool: exposed name and compiled schemas.
+fn tool_entry(server: &str, tool: &Tool) -> ToolEntry {
+    let mut exposed = tool.clone();
+    exposed.name = exposed_name(server, &tool.name).into();
+    ToolEntry {
+        server: server.to_owned(),
+        upstream_name: tool.name.to_string(),
+        validator: compile_schema(&tool.name, SchemaKind::Input, &tool.input_schema),
+        output_validator: tool
+            .output_schema
+            .as_deref()
+            .and_then(|schema| compile_schema(&tool.name, SchemaKind::Output, schema)),
+        tool: exposed,
+    }
+}
+
+/// Which schema of a tool is compiled (only changes the log message).
+#[derive(Clone, Copy)]
+enum SchemaKind {
+    Input,
+    Output,
+}
+
+/// Compiles one of a tool's JSON Schemas, whatever its root (object, array, primitive:
+/// SEP-2106). A schema that cannot be compiled is not blocking: log it and keep the tool
+/// (for `inputSchema`, the upstream is then left to validate by itself).
+///
+/// No external `$ref` is fetched: `jsonschema` is built without `resolve-http` and
+/// `resolve-file`, so such a reference makes the compilation fail instead.
+fn compile_schema(
+    tool: &str,
+    kind: SchemaKind,
+    schema: &JsonObject,
+) -> Option<Arc<jsonschema::Validator>> {
+    let schema = serde_json::Value::Object(schema.clone());
     match jsonschema::validator_for(&schema) {
         Ok(v) => Some(Arc::new(v)),
         Err(e) => {
-            tracing::warn!(tool = %tool.name, error = %e, "inputSchema cannot be compiled, validation delegated to the upstream");
+            match kind {
+                SchemaKind::Input => tracing::warn!(
+                    tool,
+                    error = %e,
+                    "inputSchema cannot be compiled, validation delegated to the upstream"
+                ),
+                SchemaKind::Output => {
+                    tracing::warn!(tool, error = %e, "outputSchema cannot be compiled")
+                }
+            }
             None
         }
+    }
+}
+
+/// Quality of a server's tool declarations, logged at each catalog rebuild ("catalog
+/// quality"). Names are upstream tool names.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ServerQuality {
+    server: String,
+    /// Number of tools of the server in the catalog.
+    tools: usize,
+    /// Tools that declare no `outputSchema`.
+    without_output_schema: Vec<String>,
+    /// Tools whose `outputSchema` is declared but cannot be compiled.
+    invalid_output_schema: Vec<String>,
+    /// Tools that declare no `annotations`.
+    without_annotations: Vec<String>,
+}
+
+/// Groups the catalog entries by server and lists, for each one, the tools whose
+/// declaration is incomplete. Servers come out sorted by name.
+fn catalog_quality<'a>(entries: impl IntoIterator<Item = &'a ToolEntry>) -> Vec<ServerQuality> {
+    let mut by_server: BTreeMap<&str, ServerQuality> = BTreeMap::new();
+    for entry in entries {
+        let q = by_server
+            .entry(&entry.server)
+            .or_insert_with(|| ServerQuality {
+                server: entry.server.clone(),
+                ..ServerQuality::default()
+            });
+        q.tools += 1;
+        let name = || entry.upstream_name.clone();
+        match (&entry.tool.output_schema, &entry.output_validator) {
+            (None, _) => q.without_output_schema.push(name()),
+            (Some(_), None) => q.invalid_output_schema.push(name()),
+            (Some(_), Some(_)) => {}
+        }
+        if entry.tool.annotations.is_none() {
+            q.without_annotations.push(name());
+        }
+    }
+    by_server.into_values().collect()
+}
+
+/// At most this many names per category in the "catalog quality" log line.
+const MAX_LOGGED_NAMES: usize = 20;
+
+/// Joins at most [`MAX_LOGGED_NAMES`] names, and says how many were left out.
+fn sample_names(names: &[String]) -> String {
+    let shown = names[..names.len().min(MAX_LOGGED_NAMES)].join(", ");
+    match names.len().saturating_sub(MAX_LOGGED_NAMES) {
+        0 => shown,
+        more => format!("{shown}, … (+{more})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    /// An upstream tool with this input schema, optional output schema and annotations.
+    fn tool(name: &str, output_schema: Option<Value>, annotated: bool) -> Tool {
+        let mut value = json!({
+            "name": name,
+            "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}}},
+        });
+        if let Some(schema) = output_schema {
+            value["outputSchema"] = schema;
+        }
+        if annotated {
+            value["annotations"] = json!({"readOnlyHint": true});
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn entry(server: &str, name: &str, output_schema: Option<Value>, annotated: bool) -> ToolEntry {
+        tool_entry(server, &tool(name, output_schema, annotated))
+    }
+
+    #[test]
+    fn valid_output_schema_is_compiled() {
+        let schema = json!({"type": "object", "properties": {"n": {"type": "integer"}}});
+        let e = entry("srv", "t", Some(schema), false);
+        let validator = e.output_validator.expect("compiled");
+        assert!(validator.is_valid(&json!({"n": 1})));
+        assert!(!validator.is_valid(&json!({"n": "one"})));
+        assert_eq!(e.tool.name, "srv_t");
+        assert!(e.validator.is_some());
+    }
+
+    #[test]
+    fn missing_output_schema_gives_no_validator() {
+        let e = entry("srv", "t", None, false);
+        assert!(e.output_validator.is_none());
+        assert!(e.tool.output_schema.is_none());
+    }
+
+    #[test]
+    fn invalid_output_schema_keeps_the_tool_and_its_declaration() {
+        let e = entry("srv", "t", Some(json!({"type": 12})), false);
+        assert!(e.output_validator.is_none());
+        // The declaration is kept as is (it is still returned by search_tools).
+        assert_eq!(e.tool.output_schema.as_deref().unwrap()["type"], 12);
+        assert!(e.validator.is_some());
+    }
+
+    #[test]
+    fn pydantic_output_schema_with_local_refs_is_compiled() {
+        let schema = json!({
+            "$defs": {
+                "Item": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                },
+            },
+            "type": "object",
+            "properties": {"results": {"type": "array", "items": {"$ref": "#/$defs/Item"}}},
+            "required": ["results"],
+        });
+        let validator = entry("srv", "t", Some(schema), false)
+            .output_validator
+            .expect("compiled");
+        assert!(validator.is_valid(&json!({"results": [{"id": "a"}]})));
+        assert!(!validator.is_valid(&json!({"results": [{}]})));
+    }
+
+    #[test]
+    fn non_object_root_output_schemas_are_compiled() {
+        // SEP-2106: the root of an outputSchema can be an array, a primitive…
+        let array = json!({"type": "array", "items": {"type": "string"}});
+        let validator = entry("srv", "t", Some(array), false)
+            .output_validator
+            .expect("array root");
+        assert!(validator.is_valid(&json!(["a", "b"])));
+        assert!(!validator.is_valid(&json!({"a": 1})));
+
+        let integer = json!({"type": "integer"});
+        let validator = entry("srv", "t", Some(integer), false)
+            .output_validator
+            .expect("integer root");
+        assert!(validator.is_valid(&json!(3)));
+        assert!(!validator.is_valid(&json!("3")));
+    }
+
+    #[test]
+    fn remote_refs_are_not_fetched() {
+        // Built without `resolve-http` / `resolve-file`: compilation fails without any
+        // network or file access.
+        for (uri, feature) in [
+            ("https://example.invalid/schema.json", "resolve-http"),
+            ("file:///etc/passwd", "resolve-file"),
+        ] {
+            let schema = json!({"$ref": uri});
+            let e = entry("srv", "t", Some(schema.clone()), false);
+            assert!(e.output_validator.is_none(), "{uri}");
+            // The failure comes from the disabled feature, not from a network/file error.
+            let error = jsonschema::validator_for(&schema).unwrap_err().to_string();
+            assert!(error.contains(feature), "{uri}: {error}");
+        }
+    }
+
+    #[test]
+    fn catalog_quality_counts_incomplete_declarations_per_server() {
+        let ok = json!({"type": "object"});
+        let entries = [
+            entry("b", "full", Some(ok.clone()), true),
+            entry("b", "bare", None, false),
+            entry("a", "broken", Some(json!({"type": 12})), true),
+            entry("a", "plain", Some(ok), false),
+            entry("a", "none", None, true),
+        ];
+        let quality = catalog_quality(&entries);
+        assert_eq!(
+            quality,
+            vec![
+                ServerQuality {
+                    server: "a".into(),
+                    tools: 3,
+                    without_output_schema: vec!["none".into()],
+                    invalid_output_schema: vec!["broken".into()],
+                    without_annotations: vec!["plain".into()],
+                },
+                ServerQuality {
+                    server: "b".into(),
+                    tools: 2,
+                    without_output_schema: vec!["bare".into()],
+                    invalid_output_schema: vec![],
+                    without_annotations: vec!["bare".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn logged_names_are_truncated() {
+        let names: Vec<String> = (0..23).map(|i| format!("t{i}")).collect();
+        assert_eq!(sample_names(&names[..2]), "t0, t1");
+        assert_eq!(sample_names(&[]), "");
+        let sample = sample_names(&names);
+        assert!(sample.starts_with("t0, t1,"), "{sample}");
+        assert!(sample.contains("t19, … (+3)"), "{sample}");
+        assert!(!sample.contains("t20"), "{sample}");
     }
 }

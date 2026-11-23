@@ -110,8 +110,20 @@ N × `timeout`.
 
 The `ToolCatalog` is **immutable**: the `exposed name → ToolEntry` table (a `BTreeMap`, for
 a deterministic `tools/list` order) and the BM25 index. Each `ToolEntry` holds the exposed
-definition (renamed to `{server}_{tool}`), the upstream name and the compiled JSON Schema
-validator.
+definition (renamed to `{server}_{tool}`), the upstream name, the JSON Schema validator
+compiled from `inputSchema` (used to validate `call_tool` arguments) and, when the tool
+declares one, the validator compiled from `outputSchema` (`output_validator`). Schemas are
+compiled at rebuild time, off the request path, whatever their root (object, array,
+primitive: SEP-2106); a schema that cannot be compiled is logged and leaves the validator
+empty, without hiding the tool. `output_validator` is not used to validate `call_tool`
+responses, which are relayed as is. `jsonschema` is built without `resolve-http` and
+`resolve-file`: an external `$ref` makes the compilation fail instead of being fetched.
+
+At each rebuild, one `"message": "catalog quality"` log line per server reports the number
+of tools without `outputSchema` (`without_output_schema`), with an `outputSchema` that
+cannot be compiled (`invalid_output_schema`) and without `annotations`
+(`without_annotations`), with the names concerned (at most 20 per category). It contains
+only tool names and counters.
 
 To change the catalog, `rebuild_catalog` builds a new one alongside, then publishes it in
 one go with `store()`. In-flight requests keep the old version until they finish: none of
@@ -140,6 +152,11 @@ because the tool list depends on the upstreams. The arguments of the gateway's t
 
 `CallToolArgs` mirrors the protocol shape exactly (`name` + `arguments` as a JSON object):
 the target tool's arguments are only known at runtime, so they are not typed.
+
+Each `search_tools` result carries the exposed name, server, title, description, full
+`input_schema`, `annotations` and BM25 `score`, plus `output_schema` (the upstream's
+`outputSchema`, as declared) when the tool declares one; the key is omitted otherwise. The
+`catalog://servers/{name}/tools` inventory returns the same `output_schema` field.
 
 ### `catalog` and `guide`: the resources
 
@@ -292,8 +309,8 @@ longer value is rejected with a tool error that tells the LLM to shorten it.
 
 | Level | Where | What is checked |
 | --- | --- | --- |
-| Unit | `#[cfg(test)]` in each module | config, BM25, semaphores, extraction of guide citations |
-| Integration | `tests/gateway.rs` | end to end with real mock MCP servers: search, calls, errors, timeout, saturation, catalog, guide, progress, older clients, graceful shutdown |
+| Unit | `#[cfg(test)]` in each module | config, BM25, semaphores, extraction of guide citations, schema compilation and catalog quality counters |
+| Integration | `tests/gateway.rs` | end to end with real mock MCP servers: search (including `output_schema`), calls, structured results relayed as is, errors, timeout, saturation, catalog, guide, progress, older clients, graceful shutdown |
 | Guide drift | `tests/guide_drift.rs` (ignored by default) | cited servers enabled in the registry; cited tools present on the real upstreams |
 | Performance | `benches/overhead.rs` | direct call vs through the gateway |
 
