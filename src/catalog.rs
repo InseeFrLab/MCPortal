@@ -9,7 +9,7 @@
 //! | `catalog://servers` | all servers: domain, description, tags, `enabled`, prefix, limits, status |
 //! | `catalog://domains` | servers grouped by domain |
 //! | `catalog://servers/{name}` | details of a server + metrics (tools, probes) |
-//! | `catalog://servers/{name}/tools` | inventory: upstream name, name to call, description, parameters |
+//! | `catalog://servers/{name}/tools` | inventory: upstream name, name to call, description, parameters, output schema if declared |
 //! | `catalog://guide` | usage guide (see [`crate::guide`]) |
 //!
 //! Every response is generated **on read** from the current state: there is no second
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use rmcp::{
     ErrorData as McpError,
-    model::{Resource, ResourceContents, ResourceTemplate},
+    model::{Resource, ResourceContents, ResourceTemplate, Tool},
 };
 use serde_json::{Value, json};
 
@@ -202,6 +202,15 @@ fn server_detail(u: &Upstream) -> Value {
     value
 }
 
+/// Adds the tool's `outputSchema`, as declared by the upstream (whatever its root), under
+/// `output_schema`. The key is left out when the tool declares none: no tokens spent on a
+/// `null`. Shared by the inventory and `search_tools` results.
+pub(crate) fn insert_output_schema(value: &mut Value, tool: &Tool) {
+    if let Some(schema) = &tool.output_schema {
+        value["output_schema"] = Value::Object((**schema).clone());
+    }
+}
+
 fn tool_inventory(u: &Upstream) -> Value {
     let health = u.health_snapshot();
     let Some(tools) = u.cached_tools() else {
@@ -216,14 +225,16 @@ fn tool_inventory(u: &Upstream) -> Value {
     let tools: Vec<Value> = tools
         .iter()
         .map(|t| {
-            json!({
+            let mut value = json!({
                 "upstream_name": t.name,
                 "name": exposed_name(&u.config.name, &t.name),
                 "title": t.title,
                 "description": t.description,
                 "input_schema": t.input_schema,
                 "annotations": t.annotations,
-            })
+            });
+            insert_output_schema(&mut value, t);
+            value
         })
         .collect();
     json!({

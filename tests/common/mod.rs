@@ -11,7 +11,10 @@ use std::{sync::Arc, time::Duration};
 use mcportal::{config::Config, server, state::AppState};
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{
+        router::tool::ToolRouter,
+        wrapper::{Json, Parameters},
+    },
     model::{
         CallToolRequestParams, CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities,
         ServerConfig,
@@ -53,6 +56,30 @@ pub struct AddArgs {
 pub struct SlowArgs {
     /// Wait duration in milliseconds
     pub ms: u64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct LookupArgs {
+    /// Identifier of the record to look up
+    pub id: String,
+}
+
+/// Structured result of `lookup`. The nested [`LookupRecord`] gives the generated
+/// `outputSchema` a `$defs` section with a local `$ref`, like Pydantic-based servers.
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct LookupOutput {
+    /// Identifier that was looked up
+    pub id: String,
+    /// The record found
+    pub record: LookupRecord,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct LookupRecord {
+    /// Label of the record
+    pub label: String,
+    /// Length of the identifier
+    pub size: u64,
 }
 
 #[derive(Clone)]
@@ -100,6 +127,20 @@ impl MockUpstream {
             }
         }
         "done".into()
+    }
+
+    #[tool(
+        description = "Looks up a record by identifier (lookup), structured result",
+        annotations(read_only_hint = true)
+    )]
+    fn lookup(&self, Parameters(LookupArgs { id }): Parameters<LookupArgs>) -> Json<LookupOutput> {
+        Json(LookupOutput {
+            record: LookupRecord {
+                label: format!("record {id}"),
+                size: id.len() as u64,
+            },
+            id,
+        })
     }
 
     #[tool(description = "Waits for a while before responding (slow)")]

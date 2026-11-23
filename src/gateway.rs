@@ -143,7 +143,8 @@ impl Gateway {
             tools.push(Tool::new(
                 SEARCH_TOOLS,
                 "Searches for tools across all the gateway's servers (full-text search). \
-                 Returns, for each tool, the name to call and its inputSchema. \
+                 Returns, for each tool, the name to call, its inputSchema and, when declared, \
+                 its outputSchema (shape of the structuredContent returned). \
                  Use it before call_tool.",
                 schema_for_type::<SearchToolsArgs>(),
             ));
@@ -222,8 +223,9 @@ impl Gateway {
             .filter_map(|hit| catalog.tools.get(&hit.name).map(|entry| (hit, entry)))
             .map(|(hit, entry)| {
                 // Return the full inputSchema: without it, the LLM cannot build call_tool's
-                // `arguments` correctly.
-                json!({
+                // `arguments` correctly. The outputSchema, when declared, tells it the shape
+                // of the structuredContent it will receive.
+                let mut value = json!({
                     "name": hit.name,
                     "server": entry.server,
                     "title": entry.tool.title,
@@ -231,7 +233,9 @@ impl Gateway {
                     "input_schema": entry.tool.input_schema,
                     "annotations": entry.tool.annotations,
                     "score": hit.score,
-                })
+                });
+                catalog::insert_output_schema(&mut value, &entry.tool);
+                value
             })
             .collect();
 

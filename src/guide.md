@@ -16,7 +16,9 @@ servers' tools, only three gateway tools:
 
 1. `search_tools(query)`: full-text search (keywords, preferably in the language of the
    tool descriptions) across the names, descriptions and parameters of every tool. Each
-   result gives the name to call and its full `inputSchema`.
+   result gives the name to call and its full `inputSchema`. When a result also carries
+   an `output_schema`, the tool's response contains a `structuredContent` matching that
+   schema (an object, a list or a single value): read the data from `structuredContent`.
 2. `call_tool(name, arguments)`: calls the tool `name` (full name `{server}_{tool}`).
    `arguments` is a **JSON object** matching the `inputSchema` returned by the search,
    not a string.
@@ -37,7 +39,7 @@ The catalog is exposed as resources: reading it costs nothing until it is reques
 | `catalog://servers` | all servers: domain, description, tags, status, limits |
 | `catalog://domains` | servers grouped by functional domain |
 | `catalog://servers/{name}` | details of a server and its metrics (tools, probes) |
-| `catalog://servers/{name}/tools` | inventory: upstream name, name to call, description, parameters |
+| `catalog://servers/{name}/tools` | inventory: upstream name, name to call, description, parameters, output schema if declared |
 | `catalog://guide` | this guide, followed by the deployment-specific workflows |
 
 An unreachable server does not break the catalog: its resource responds with
